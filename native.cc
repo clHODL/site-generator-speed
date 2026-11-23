@@ -968,7 +968,6 @@ __attribute__((target("avx2"))) static void appendJsonEscapedAVX2(Buf& out, Str 
   size_t i = 0;
   const __m256i q = _mm256_set1_epi8('"');
   const __m256i bs = _mm256_set1_epi8('\\');
-  const __m256i lt = _mm256_set1_epi8(0x20);
   const __m256i bias = _mm256_set1_epi8((char)0x80);
   const __m256i hiED = _mm256_set1_epi8((char)0xED);
   const __m256i zero = _mm256_setzero_si256();
@@ -989,27 +988,42 @@ __attribute__((target("avx2"))) static void appendJsonEscapedAVX2(Buf& out, Str 
       i += 32;
       continue;
     }
-    // Slow lane for this chunk: byte by byte.
-    for (size_t j = i; j < i + 32; j++) {
+    // Mask-driven: memcpy the clean runs, escape only the flagged bytes.
+    // (The old code fell back to a byte-by-byte loop for the whole chunk
+    // whenever it held any '"' — and HTML is full of '"' — so the SIMD
+    // never actually sped anything up.)
+    size_t pos = i;  // next byte to copy from
+    uint32_t m = mask;
+    while (m) {
+      unsigned b = (unsigned)__builtin_ctz(m);
+      size_t j = i + b;
+      if (j > pos) out.append((const char*)p + pos, j - pos);
       uint8_t c = p[j];
       if (c == '"' || c == '\\') {
         out.push('\\');
         out.push((char)c);
+        pos = j + 1;
       } else if (c < 0x20) {
         char tmp[8];
-        int m = std::snprintf(tmp, sizeof tmp, "\\u%04x", c);
-        out.append(tmp, (size_t)m);
+        int mm = std::snprintf(tmp, sizeof tmp, "\\u%04x", c);
+        out.append(tmp, (size_t)mm);
+        pos = j + 1;
       } else if (c == 0xED && j + 2 < n && (p[j + 1] & 0xF0) == 0xA0 &&
                  (p[j + 2] & 0xC0) == 0x80) {
         uint32_t cp = ((c & 0x0F) << 12) | ((p[j + 1] & 0x3F) << 6) | (p[j + 2] & 0x3F);
         char tmp[8];
-        int m = std::snprintf(tmp, sizeof tmp, "\\u%04x", cp);
-        out.append(tmp, (size_t)m);
-        j += 2;
+        int mm = std::snprintf(tmp, sizeof tmp, "\\u%04x", cp);
+        out.append(tmp, (size_t)mm);
+        pos = j + 3;
       } else {
         out.push((char)c);
+        pos = j + 1;
       }
+      m &= m - 1;  // clear the lowest set bit (continuation bytes of a
+                   // 0xED sequence can never be escape bytes, so no
+                   // further mask fix-up is needed)
     }
+    if (pos < i + 32) out.append((const char*)p + pos, i + 32 - pos);
     i += 32;
   }
   // Scalar tail.
@@ -2829,6 +2843,7 @@ static void appendTextOfEscaped(Buf& out, const Val* v) {
 // at index 0 (nframes = 1 on entry); loop frames are pushed/popped here.
 static void execTemplate(Template* tpls, int32_t startIdx, Frame* frames, uint32_t& nframes,
                          Buf& out) {
+  ProfTimer _pt("tpl.exec");
   struct Call {
     int32_t tmpl;
     uint32_t pc;
@@ -3074,11 +3089,14 @@ static bool runCase(Arena* ar, const Val& input, CaseOut& out) {
     const Val* srcV = templatesV->find(tplNames[i]);
     Str src = (srcV && srcV->type == Val::Str) ? srcV->s : Str();
     TplErr err;
-    if (compileTemplate(ar, tplNames[i], src, tpls[i], tplNames, nameIdx, ntplNames, err)) {
-      tplOk[i] = true;
-    } else {
-      tplOk[i] = false;
-      pushReport(err.msg);
+    {
+      ProfTimer _pt("tpl.compile");
+      if (compileTemplate(ar, tplNames[i], src, tpls[i], tplNames, nameIdx, ntplNames, err)) {
+        tplOk[i] = true;
+      } else {
+        tplOk[i] = false;
+        pushReport(err.msg);
+      }
     }
   }
   // Includes pointing at a template that failed to parse render nothing.
@@ -3827,6 +3845,7 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
   if (const char* e = std::getenv("MAKEFUN_OUTPUT_DIR")) outputDir = e;
   std::string casesPath = inputDir + "/cases.json";
   std::string outPath = outputDir + "/answers.json";
+  ProfTimer _ptAll("runAll.total");
   if (argc >= 1) {
     char buf[1024];
     size_t len = 0;
@@ -3839,7 +3858,11 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
     if (napi_get_value_string_utf8(env, argv[1], buf, sizeof buf, &len) == napi_ok && len > 0)
       outPath.assign(buf, len);
   }
-  FILE* f = std::fopen(casesPath.c_str(), "rb");
+  FILE* f = nullptr;
+  {
+    ProfTimer _ptF("file.read");
+    f = std::fopen(casesPath.c_str(), "rb");
+  }
   if (!f) {
     napiThrow(env, ("cannot open " + casesPath).c_str());
     return nullptr;
@@ -3856,18 +3879,27 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   {
-    ProfTimer _pt("json_parse");
     Arena inputAr;
-    inputAr.init(64u << 20);
-    JsonParser parser((const uint8_t*)buf, (const uint8_t*)buf + fsize, &inputAr);
-    Val cases = parser.parse();
-    if (!parser.ok || cases.type != Val::Arr) {
-      std::free(buf);
-      napiThrow(env, "cases.json is not a JSON array");
-      return nullptr;
+    {
+      ProfTimer _ptA("arena.init");
+      inputAr.init(64u << 20);
+    }
+    Val cases;
+    {
+      ProfTimer _pt("json_parse");
+      JsonParser parser((const uint8_t*)buf, (const uint8_t*)buf + fsize, &inputAr);
+      cases = parser.parse();
+      if (!parser.ok || cases.type != Val::Arr) {
+        std::free(buf);
+        napiThrow(env, "cases.json is not a JSON array");
+        return nullptr;
+      }
     }
     Arena buildAr;
-    buildAr.init(128u << 20);
+    {
+      ProfTimer _ptB("arena.init");
+      buildAr.init(128u << 20);
+    }
     Buf answers;
     answers.reserve(8u << 20);
     answers.push('[');
@@ -3890,7 +3922,10 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
         }
       }
       if (ci) answers.push(',');
-      appendCaseJson(answers, out);
+      {
+        ProfTimer _pt3("json_write");
+        appendCaseJson(answers, out);
+      }
     }
     answers.push(']');
     FILE* of = std::fopen(outPath.c_str(), "wb");

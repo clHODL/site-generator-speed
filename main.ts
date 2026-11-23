@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
-setFlagsFromString('--no-incremental-marking');
+setFlagsFromString('--no-incremental-marking --no-opt');
 const mod = (await import(new URL('./solve.js', import.meta.url).href)) as {
   run: (input: unknown) => unknown;
   runAll?: (inPath: string, outPath: string) => number;
