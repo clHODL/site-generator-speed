@@ -55,6 +55,40 @@ using U16V = std::u16string_view;
 using U8 = std::string;
 using U8V = std::string_view;
 
+// ---- profiler: NATIVE_PROFILE=1 prints accumulated phase times to stderr.
+// Zero cost when unset (timers still run but are cheap steady_clock reads).
+#include <chrono>
+struct Prof {
+  inline static long nodes_text = 0, nodes_var = 0, nodes_raw = 0, nodes_if = 0, nodes_for = 0, nodes_inc = 0;
+  static std::unordered_map<std::string, double>& acc() {
+    static std::unordered_map<std::string, double> m; return m;
+  }
+  static std::unordered_map<std::string, long>& cnt() {
+    static std::unordered_map<std::string, long> m; return m;
+  }
+  static void add(const char* name, double ms) { acc()[name] += ms; cnt()[name]++; }
+  static void print() {
+    std::vector<std::pair<std::string, double>> v(acc().begin(), acc().end());
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    double total = 0;
+    for (auto& kv : v) total += kv.second;
+    std::fprintf(stderr, "[profile] total %.1f ms\n", total);
+    for (auto& kv : v)
+      std::fprintf(stderr, "[profile] %8.1f ms  %6ld  %s\n", kv.second, cnt()[kv.first], kv.first.c_str());
+    std::fprintf(stderr, "[profile] nodes text %ld var %ld raw %ld if %ld for %ld include %ld\n",
+                 nodes_text, nodes_var, nodes_raw, nodes_if, nodes_for, nodes_inc);
+  }
+};
+struct ProfTimer {
+  const char* name;
+  std::chrono::steady_clock::time_point t0;
+  explicit ProfTimer(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+  ~ProfTimer() {
+    auto t1 = std::chrono::steady_clock::now();
+    Prof::add(name, std::chrono::duration<double, std::milli>(t1 - t0).count());
+  }
+};
+
 // ---------------------------------------------------------------- values
 
 struct Value {
@@ -213,6 +247,7 @@ struct JsonParser {
     return false;
   }
   bool parse(Value& out) {
+    ProfTimer _pt("json_parse");
     ws();
     if (!value(out)) return false;
     ws();
@@ -284,10 +319,40 @@ struct JsonParser {
     }
   }
   // Parse a JSON string (p at the opening quote) into UTF-16 code units.
+  // Fast path: scan 8 bytes at a time for the next byte needing special
+  // handling ('"', '\\', or >= 0x80), then widen the plain ASCII run in bulk.
   bool str(U16& out) {
     p++; // "
     out.clear();
     while (p < end) {
+      const uint8_t* runStart = p;
+      while (p < end) {
+        size_t remaining = (size_t)(end - p);
+        if (remaining >= 8) {
+          uint64_t w;
+          std::memcpy(&w, p, 8);
+          uint64_t d22 = w ^ 0x2222222222222222ULL;
+          uint64_t h22 = (d22 - 0x0101010101010101ULL) & ~d22 & 0x8080808080808080ULL;
+          uint64_t d5c = w ^ 0x5C5C5C5C5C5C5C5CULL;
+          uint64_t h5c = (d5c - 0x0101010101010101ULL) & ~d5c & 0x8080808080808080ULL;
+          uint64_t hi = w & 0x8080808080808080ULL;
+          uint64_t bad = h22 | h5c | hi;
+          if (bad == 0) { p += 8; continue; }
+          p += (size_t)(__builtin_ctzll(bad) / 8);
+          break;
+        }
+        uint8_t c = *p;
+        if (c == '"' || c == '\\' || c >= 0x80) break;
+        p++;
+      }
+      size_t runLen = (size_t)(p - runStart);
+      if (runLen > 0) {
+        size_t old = out.size();
+        out.resize(old + runLen);
+        char16_t* dst = out.data() + old;
+        for (size_t k = 0; k < runLen; k++) dst[k] = (char16_t)runStart[k];
+      }
+      if (p >= end) break;
       uint8_t c = *p;
       if (c == '"') { p++; return true; }
       if (c == '\\') {
@@ -325,7 +390,6 @@ struct JsonParser {
         }
         continue;
       }
-      if (c < 0x80) { out.push_back(c); p++; continue; }
       utf16Push(out, utf8Decode(p, end));
     }
     return fail("unterminated string");
@@ -368,8 +432,12 @@ struct JsonParser {
 static void jsonEscapeInto(U8& out, U16V s) {
   static const char* HEX = "0123456789abcdef";
   out.push_back('"');
-  for (size_t i = 0; i < s.size(); i++) {
-    char16_t c = s[i];
+  const char16_t* p = s.data();
+  size_t n = s.size();
+  size_t i = 0;
+  // Scalar step for one code unit at idx (advances past a surrogate pair).
+  auto scalar = [&](size_t& idx) {
+    char16_t c = p[idx];
     if (c == '"') out += "\\\"";
     else if (c == '\\') out += "\\\\";
     else if (c == '\b') out += "\\b";
@@ -384,9 +452,9 @@ static void jsonEscapeInto(U8& out, U16V s) {
     } else if (c >= 0xD800 && c < 0xE000) {
       // Lone surrogate (or half of a pair): a pair is emitted as raw
       // UTF-8 below; a lone one must be \u-escaped, as JSON.stringify does.
-      if (c < 0xDC00 && i + 1 < s.size() && s[i + 1] >= 0xDC00 && s[i + 1] < 0xE000) {
-        uint32_t cp = 0x10000 + ((c - 0xD800) << 10) + (s[i + 1] - 0xDC00);
-        i++;
+      if (c < 0xDC00 && idx + 1 < n && p[idx + 1] >= 0xDC00 && p[idx + 1] < 0xE000) {
+        uint32_t cp = 0x10000 + ((c - 0xD800) << 10) + (p[idx + 1] - 0xDC00);
+        idx++;
         out.push_back((char)(0xF0 | (cp >> 18)));
         out.push_back((char)(0x80 | ((cp >> 12) & 0x3F)));
         out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
@@ -411,7 +479,32 @@ static void jsonEscapeInto(U8& out, U16V s) {
         out.push_back((char)(0x80 | (c & 0x3F)));
       }
     }
+    idx++;
+  };
+  // SWAR fast path: 4 UTF-16 units at a time when all four are safe ASCII
+  // (0x20..0x7F except '"' and '\\'), packed into 4 UTF-8 bytes at once.
+  while (i + 4 <= n) {
+    uint64_t w;
+    std::memcpy(&w, p + i, 8);
+    if ((w & 0xFF00FF00FF00FF00ULL) == 0) {
+      uint64_t x = w | 0x2000200020002000ULL;  // high bytes -> 0x20 (safe)
+      uint64_t lo = (x - 0x2020202020202020ULL) & ~x & 0x8080808080808080ULL;
+      uint64_t d22 = x ^ 0x2222222222222222ULL;
+      uint64_t h22 = (d22 - 0x0101010101010101ULL) & ~d22 & 0x8080808080808080ULL;
+      uint64_t d5c = x ^ 0x5C5C5C5C5C5C5C5CULL;
+      uint64_t h5c = (d5c - 0x0101010101010101ULL) & ~d5c & 0x8080808080808080ULL;
+      uint64_t hi = x & 0x8080808080808080ULL;
+      if ((lo | h22 | h5c | hi) == 0) {
+        uint32_t packed = (uint32_t)(w & 0xFF) | (uint32_t)((w >> 8) & 0xFF00) |
+                          (uint32_t)((w >> 16) & 0xFF0000) | (uint32_t)((w >> 24) & 0xFF000000);
+        out.append((const char*)&packed, 4);
+        i += 4;
+        continue;
+      }
+    }
+    scalar(i);
   }
+  while (i < n) scalar(i);
   out.push_back('"');
 }
 
@@ -528,6 +621,21 @@ static U16 escapeHtml(U16V text) {
   return out;
 }
 
+// Append `s` to `out`, HTML-escaping & < > " ' (the template engine's rule),
+// without building an intermediate string.
+static void appendEscaped(U16& out, U16V s) {
+  size_t i = 0, n = s.size();
+  while (i < n) {
+    size_t j = i;
+    while (j < n && !isEscSpecial(s[j])) j++;
+    if (j > i) out.append(s.data() + i, j - i);
+    if (j == n) break;
+    const char* e = escapeHtmlChar(s[j]);
+    while (*e) { out.push_back((char16_t)(uint8_t)*e); e++; }
+    i = j + 1;
+  }
+}
+
 // JS \s (White_Space + line terminators), as a table over code units.
 static const bool* wsTable() {
   static bool t[65536];
@@ -632,6 +740,7 @@ static U16 slugAscii(U16V text) {
 }
 
 static U16 slugifyUncached(U16V text) {
+  ProfTimer _pt("slugify");
   bool ascii = true;
   for (char16_t c : text) if (c > 127) { ascii = false; break; }
   if (ascii) return slugAscii(text);
@@ -1100,10 +1209,8 @@ static size_t nextInlineSpecial(U16V s, size_t i) {
 
 using LinkFn = std::function<U16(U16V)>;
 
-// `s` rendered inline; link(target) is a link's href.
-static U16 inlineMd(U16V s, const LinkFn& link) {
-  U16 out;
-  out.reserve(s.size() + 16);
+// `s` rendered inline into `out`; link(target) is a link's href.
+static void inlineMdInto(U16& out, U16V s, const LinkFn& link) {
   size_t i = 0, n = s.size();
   while (i < n) {
     size_t k = nextInlineSpecial(s, i);
@@ -1131,7 +1238,7 @@ static U16 inlineMd(U16V s, const LinkFn& link) {
       size_t j = s.find('`', k + 1);
       if (j != U16V::npos && j > k + 1) {
         out += U16(u"<code>");
-        out += escapeHtml(s.substr(k + 1, j - (k + 1)));
+        appendEscaped(out, s.substr(k + 1, j - (k + 1)));
         out += U16(u"</code>");
         i = j + 1;
       } else {
@@ -1145,7 +1252,7 @@ static U16 inlineMd(U16V s, const LinkFn& link) {
         size_t j = findUnescaped(s, U16V(u"**"), k + 2);
         if (j != U16V::npos && j > k + 2) {
           out += U16(u"<strong>");
-          out += inlineMd(s.substr(k + 2, j - (k + 2)), link);
+          inlineMdInto(out, s.substr(k + 2, j - (k + 2)), link);
           out += U16(u"</strong>");
           i = j + 2;
         } else {
@@ -1156,7 +1263,7 @@ static U16 inlineMd(U16V s, const LinkFn& link) {
         size_t j = findSingleStar(s, k + 1);
         if (j != U16V::npos && j > k + 1) {
           out += U16(u"<em>");
-          out += inlineMd(s.substr(k + 1, j - (k + 1)), link);
+          inlineMdInto(out, s.substr(k + 1, j - (k + 1)), link);
           out += U16(u"</em>");
           i = j + 1;
         } else {
@@ -1176,9 +1283,9 @@ static U16 inlineMd(U16V s, const LinkFn& link) {
       for (char16_t t : target) if (isWS(t)) { hasWs = true; break; }
       if (!target.empty() && !hasWs) {
         out += U16(u"<a href=\"");
-        out += escapeHtml(link(target));
+        appendEscaped(out, link(target));
         out += U16(u"\">");
-        out += inlineMd(s.substr(k + 1, k2 - (k + 1)), link);
+        inlineMdInto(out, s.substr(k + 1, k2 - (k + 1)), link);
         out += U16(u"</a>");
         i = mm + 1;
       } else {
@@ -1193,6 +1300,13 @@ static U16 inlineMd(U16V s, const LinkFn& link) {
     } else out.push_back(c);
     i = k + 1;
   }
+}
+
+// Wrapper: render `s` inline into a fresh string.
+static U16 inlineMd(U16V s, const LinkFn& link) {
+  U16 out;
+  out.reserve(s.size() + 16);
+  inlineMdInto(out, s, link);
   return out;
 }
 
@@ -1210,6 +1324,7 @@ struct MdResult {
 
 // `src` rendered: HTML, table of contents (level 2/3 headings), excerpt.
 static MdResult renderMarkdown(U16V src, const LinkFn& link, SlugCache& slugs) {
+  ProfTimer _pt("renderMarkdown");
   // Split into lines (views).
   std::vector<U16V> lines;
   {
@@ -1225,7 +1340,15 @@ static MdResult renderMarkdown(U16V src, const LinkFn& link, SlugCache& slugs) {
   std::vector<uint8_t> kinds(n);
   for (size_t j = 0; j < n; j++) kinds[j] = lineKind(lines[j]);
 
-  std::vector<U16> blocks;
+  // Blocks are appended straight into outHtml (separator '\n' between
+  // blocks, trailing '\n' when any block exists) instead of a vector that
+  // is joined afterwards.
+  U16 outHtml;
+  bool firstBlock = true;
+  auto sep = [&]() {
+    if (!firstBlock) outHtml.push_back('\n');
+    firstBlock = false;
+  };
   std::vector<TocEnt> toc;
   U16 excerpt;
   bool hasExcerpt = false;
@@ -1259,11 +1382,11 @@ static MdResult renderMarkdown(U16V src, const LinkFn& link, SlugCache& slugs) {
       if (!body.empty()) {
         for (size_t q = 0; q < body.size(); q++) {
           if (q) code.push_back('\n');
-          code += escapeHtml(body[q]);
+          appendEscaped(code, body[q]);
         }
         code.push_back('\n');
       }
-      blocks.push_back(U16(u"<pre><code") + cls + U16(u">") + code + U16(u"</code></pre>"));
+      sep(); outHtml += U16(u"<pre><code") + cls + U16(u">") + code + U16(u"</code></pre>");
       continue;
     }
     if (kind == K_HEADING) {
@@ -1277,13 +1400,13 @@ static MdResult renderMarkdown(U16V src, const LinkFn& link, SlugCache& slugs) {
       b += U16(u" id=\"") + id + U16(u"\">") + html + U16(u"</h");
       b.push_back((char16_t)('0' + depth));
       b.push_back('>');
-      blocks.push_back(std::move(b));
+      sep(); outHtml += std::move(b);
       if (depth == 2 || depth == 3) toc.push_back({depth, id, html});
       i++;
       continue;
     }
     if (kind == K_HR) {
-      blocks.push_back(U16(u"<hr>"));
+      sep(); outHtml += U16(u"<hr>");
       i++;
       continue;
     }
@@ -1296,14 +1419,14 @@ static MdResult renderMarkdown(U16V src, const LinkFn& link, SlugCache& slugs) {
       std::vector<U16V> kept;
       for (auto& q : body) if (!q.empty()) kept.push_back(q);
       if (kept.empty()) {
-        blocks.push_back(U16(u"<blockquote>\n</blockquote>"));
+        sep(); outHtml += U16(u"<blockquote>\n</blockquote>");
       } else {
         U16 joined;
         for (size_t q = 0; q < kept.size(); q++) {
           if (q) joined.push_back('\n');
           joined += U16(kept[q]);
         }
-        blocks.push_back(U16(u"<blockquote>\n<p>") + inlineMd(joined, link) + U16(u"</p>\n</blockquote>"));
+        sep(); outHtml += U16(u"<blockquote>\n<p>") + inlineMd(joined, link) + U16(u"</p>\n</blockquote>");
       }
       continue;
     }
@@ -1356,7 +1479,7 @@ static MdResult renderMarkdown(U16V src, const LinkFn& link, SlugCache& slugs) {
         html += U16(u"<li>") + inlineMd(joined, link) + U16(u"</li>\n");
       }
       html += U16(u"</") + tag + U16(u">");
-      blocks.push_back(std::move(html));
+      sep(); outHtml += std::move(html);
       continue;
     }
     // Paragraph.
@@ -1375,17 +1498,10 @@ static MdResult renderMarkdown(U16V src, const LinkFn& link, SlugCache& slugs) {
     }
     U16 html = inlineMd(text, link);
     if (!hasExcerpt) { excerpt = html; hasExcerpt = true; }
-    blocks.push_back(U16(u"<p>") + html + U16(u"</p>"));
+    sep(); outHtml += U16(u"<p>") + html + U16(u"</p>");
   }
-  U16 html;
-  if (!blocks.empty()) {
-    for (size_t q = 0; q < blocks.size(); q++) {
-      if (q) html.push_back('\n');
-      html += blocks[q];
-    }
-    html.push_back('\n');
-  }
-  return {std::move(html), std::move(toc), hasExcerpt ? excerpt : U16()};
+  if (!firstBlock) outHtml.push_back('\n');
+  return {std::move(outHtml), std::move(toc), hasExcerpt ? excerpt : U16()};
 }
 
 // ---------------------------------------------------------------- templates
@@ -1562,6 +1678,7 @@ static bool matchInclude(U16V tag, U16& name) {
 
 // `src` parsed into its tree of nodes (a TemplateError when it does not parse).
 static TplTree parseTemplate(U16V name, U16V src) {
+  ProfTimer _pt("parseTemplate");
   std::vector<Token> tokens = tokenize(name, src);
   TplTree root;
   std::vector<TplNode*> stack;
@@ -1712,6 +1829,59 @@ static bool truthy(const Value* v) {
   return false;
 }
 
+// Append a number in JavaScript's digits (same digits as jsNumStr).
+static void appendNumText(U16& out, double v) {
+  if (std::isnan(v)) { out += u"NaN"; return; }
+  if (std::isinf(v)) { out += v > 0 ? u"Infinity" : u"-Infinity"; return; }
+  if (v == 0) { out += u"0"; return; }
+  char buf[40];
+  double iv;
+  if (std::modf(v, &iv) == 0 && std::fabs(v) < 1e21) {
+    std::snprintf(buf, sizeof buf, "%lld", (long long)iv);
+  } else {
+    std::snprintf(buf, sizeof buf, "%.17g", v);
+  }
+  for (char* p = buf; *p; p++) out.push_back((char16_t)(uint8_t)*p);
+}
+
+// Append a value as text directly into `out` (no intermediate string):
+// a string itself, a number in JavaScript's digits, true/false, an array's
+// items joined by ", ", else nothing.
+static void appendText(U16& out, const Value* v) {
+  if (!v) return;
+  switch (v->type) {
+    case Value::Str: out.append(v->str.data(), v->str.size()); return;
+    case Value::Num: appendNumText(out, v->num); return;
+    case Value::Bool: out += v->b ? u"true" : u"false"; return;
+    case Value::Arr: {
+      for (size_t i = 0; i < v->arr.size(); i++) {
+        if (i) out += u", ";
+        appendText(out, &v->arr[i]);
+      }
+      return;
+    }
+    default: return;
+  }
+}
+
+// As appendText, but HTML-escaping strings.
+static void appendTextEscaped(U16& out, const Value* v) {
+  if (!v) return;
+  switch (v->type) {
+    case Value::Str: appendEscaped(out, v->str); return;
+    case Value::Num: appendNumText(out, v->num); return;
+    case Value::Bool: out += v->b ? u"true" : u"false"; return;
+    case Value::Arr: {
+      for (size_t i = 0; i < v->arr.size(); i++) {
+        if (i) out += u", ";
+        appendTextEscaped(out, &v->arr[i]);
+      }
+      return;
+    }
+    default: return;
+  }
+}
+
 // Render `nodes` into `out`. A missing include renders nothing; an include
 // renders only while the depth is under 8.
 static void renderNodes(const TplTree& nodes, const Scope& scope, int depth, U16& out,
@@ -1721,15 +1891,19 @@ static void renderNodes(const TplTree& nodes, const Scope& scope, int depth, U16
     const TplNode& n = *np;
     switch (n.kind) {
       case TplNode::Text:
+        Prof::nodes_text++;
         out += n.text;
         break;
       case TplNode::Var:
-        out += escapeHtml(textOf(lookup(&scope, n.path, scratch)));
+        Prof::nodes_var++;
+        appendTextEscaped(out, lookup(&scope, n.path, scratch));
         break;
       case TplNode::Raw:
-        out += textOf(lookup(&scope, n.path, scratch));
+        Prof::nodes_raw++;
+        appendText(out, lookup(&scope, n.path, scratch));
         break;
       case TplNode::If: {
+        Prof::nodes_if++;
         const Value* v = lookup(&scope, n.path, scratch);
         bool cond = n.not_ ? !truthy(v) : truthy(v);
         if (cond) renderNodes(n.then_, scope, depth, out, templates);
@@ -1737,25 +1911,38 @@ static void renderNodes(const TplTree& nodes, const Scope& scope, int depth, U16
         break;
       }
       case TplNode::For: {
+        Prof::nodes_for++;
         const Value* v = lookup(&scope, n.path, scratch);
         if (v && v->type == Value::Arr) {
           size_t len = v->arr.size();
+          if (len == 0) break;
+          // Hoisted: one loop record + one child scope for all iterations;
+          // only the per-iteration fields and the item pointer move.
+          Value rec = Value::makeObj();
+          rec.set(U16(u"index"), Value::makeNum(1));
+          rec.set(U16(u"first"), Value::makeBool(true));
+          rec.set(U16(u"last"), Value::makeBool(len == 1));
+          rec.set(U16(u"length"), Value::makeNum((double)len));
+          Value* iv = rec.findMut(u"index");
+          Value* fv = rec.findMut(u"first");
+          Value* lv = rec.findMut(u"last");
+          Scope child;
+          child.vars.reserve(2);
+          child.vars.emplace_back(n.loopName, &v->arr[0]);
+          child.vars.emplace_back(U16(u"loop"), &rec);
+          child.parent = &scope;
           for (size_t k = 0; k < len; k++) {
-            Value rec = Value::makeObj();
-            rec.set(U16(u"index"), Value::makeNum((double)(k + 1)));
-            rec.set(U16(u"first"), Value::makeBool(k == 0));
-            rec.set(U16(u"last"), Value::makeBool(k == len - 1));
-            rec.set(U16(u"length"), Value::makeNum((double)len));
-            Scope child;
-            child.vars.emplace_back(n.loopName, &v->arr[k]);
-            child.vars.emplace_back(U16(u"loop"), &rec);
-            child.parent = &scope;
+            if (iv) *iv = Value::makeNum((double)(k + 1));
+            if (fv) *fv = Value::makeBool(k == 0);
+            if (lv) *lv = Value::makeBool(k == len - 1);
+            child.vars[0].second = &v->arr[k];
             renderNodes(n.body, child, depth, out, templates);
           }
         }
         break;
       }
       case TplNode::Include: {
+        Prof::nodes_inc++;
         if (depth < 8) {
           auto it = templates.find(n.includeName);
           if (it != templates.end())
@@ -1837,12 +2024,14 @@ static const U16V RESERVED_SLUGS[] = {u"posts", u"tags", u"page"};
 
 // One site's output tree: path -> text. `slugs` is the shared slug cache.
 static Value runNative(const Value& input, SlugCache& slugs) {
+  ProfTimer _pt("runNative");
   const Value* siteV = input.find(u"site");
   const Value* templatesV = input.find(u"templates");
   const Value* filesV = input.find(u"files");
   if (!siteV || !templatesV || !filesV) return Value::makeObj();
 
   // 0. Templates, parsed in code-unit order of their names.
+  auto _t0 = std::chrono::steady_clock::now();
   std::unordered_map<U16, TplTree> templates;
   std::vector<U16> report;
   if (templatesV->type == Value::Obj) {
@@ -1910,8 +2099,10 @@ static Value runNative(const Value& input, SlugCache& slugs) {
       staticsV.push_back(f);
     }
   }
+  Prof::add("step01_tpl_src", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count());
 
   // 2. Front matter; a refused source is reported and dropped, and so is a draft.
+  auto _t2 = std::chrono::steady_clock::now();
   std::vector<Source> kept;
   kept.reserve(sources.size());
   for (auto& s : sources) {
@@ -1952,8 +2143,10 @@ static Value runNative(const Value& input, SlugCache& slugs) {
     kept.push_back(std::move(s));
   }
   sources = std::move(kept);
+  Prof::add("step2_frontmatter", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t2).count());
 
   // 3. Permalinks: slug made unique in its directory, in source order.
+  auto _t3 = std::chrono::steady_clock::now();
   std::unordered_map<U16, std::unordered_set<U16>> taken;
   std::unordered_map<U16, size_t> bySource;
   for (size_t i = 0; i < sources.size(); i++) {
@@ -1985,6 +2178,8 @@ static Value runNative(const Value& input, SlugCache& slugs) {
     s.url = base + U16(u"/") + s.outDir + U16(u"/");
     bySource.emplace(s.path, i);
   }
+
+  Prof::add("step3_permalinks", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t3).count());
 
   // 4. Markdown, links resolved to the pages and static files they name.
   std::unordered_set<U16> staticPaths;
@@ -2057,6 +2252,7 @@ static Value runNative(const Value& input, SlugCache& slugs) {
   }
 
   // 5. Collections: posts newest first, then by slug; newer/older neighbours.
+  auto _t56 = std::chrono::steady_clock::now();
   std::vector<size_t> posts;
   for (size_t i = 0; i < sources.size(); i++)
     if (sources[i].post) posts.push_back(i);
@@ -2134,7 +2330,10 @@ static Value runNative(const Value& input, SlugCache& slugs) {
     return tagObjs[a].slug < tagObjs[b].slug;
   });
 
+  Prof::add("step56_coll_tags", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t56).count());
+
   // 7. Layouts.
+  auto _t7 = std::chrono::steady_clock::now();
   auto linkOf = [&](int srcIdx) -> Value {
     if (srcIdx < 0) return Value();
     const Source& s = sources[srcIdx];
@@ -2308,7 +2507,10 @@ static Value runNative(const Value& input, SlugCache& slugs) {
     }
   }
 
+  Prof::add("step7_layouts", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t7).count());
+
   // 8. The report.
+  auto _t8 = std::chrono::steady_clock::now();
   std::vector<U16> lines = report;
   for (auto& b : brokenSet) lines.push_back(b);
   std::sort(lines.begin(), lines.end());
@@ -2323,6 +2525,7 @@ static Value runNative(const Value& input, SlugCache& slugs) {
   }
   reportText.push_back('\n');
   outputSet(U16(u"build-report.txt"), Value::makeStr(std::move(reportText)));
+  Prof::add("step8_report", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t8).count());
   return output;
 }
 
@@ -2505,7 +2708,8 @@ static napi_value runAll(napi_env env, napi_callback_info info) {
     answers.arr.push_back(in ? runNative(*in, g_slugs) : Value::makeObj());
   }
   U8 out;
-  jsonWrite(out, answers);
+  out.reserve(bytes.size() * 3);  // answers run ~2.5x the input; avoid regrowth
+  { ProfTimer _pt("json_write"); jsonWrite(out, answers); }
   FILE* o = std::fopen(outPath.c_str(), "wb");
   if (!o) {
     napi_throw_error(env, nullptr, "runAll: cannot write the output file");
@@ -2513,6 +2717,7 @@ static napi_value runAll(napi_env env, napi_callback_info info) {
   }
   std::fwrite(out.data(), 1, out.size(), o);
   std::fclose(o);
+  if (std::getenv("NATIVE_PROFILE")) Prof::print();
   napi_value n;
   napi_create_int64(env, (int64_t)cases.arr.size(), &n);
   return n;
