@@ -2285,7 +2285,8 @@ static MdOut renderMarkdown(Arena* ar, Str body, InlineCtx& ctx) {
       }
       scratch.reset();
       renderInline(scratch, text, ctx);
-      Str inner = ar->dup(scratch.view());
+      // Only toc headings need the inner HTML to outlive this call.
+      Str inner = (depth == 2 || depth == 3) ? ar->dup(scratch.view()) : scratch.view();
       if (depth == 2 || depth == 3) {
         if (ntoc == capToc) {
           capToc = capToc ? capToc * 2 : 8;
@@ -2442,20 +2443,16 @@ static MdOut renderMarkdown(Arena* ar, Str body, InlineCtx& ctx) {
       scratch.append(trimST(lines[i]));
       i++;
     }
-    Str paraHtml;
-    {
-      Buf pb;
-      renderInline(pb, scratch.view(), ctx);
-      paraHtml = ar->dup(pb.view());
-    }
+    Buf pb;
+    renderInline(pb, scratch.view(), ctx);
     if (!hasExcerpt) {
-      excerpt = paraHtml;
+      excerpt = ar->dup(pb.view());
       hasExcerpt = true;
     }
     if (anyBlock) html.push('\n');
     anyBlock = true;
     html.append("<p>");
-    html.append(paraHtml);
+    html.append(pb.view());
     html.append("</p>");
   }
   MdOut out;
@@ -2478,6 +2475,7 @@ static MdOut renderMarkdown(Arena* ar, Str body, InlineCtx& ctx) {
 struct Op {
   enum K : uint8_t { Text, Var, Raw, If, Else, EndIf, For, EndFor, Include } kind;
   Str text;            // Text: literal
+  Str escText;         // Text: JSON-pre-escaped literal (stream mode)
   Str* path = nullptr; // Var/Raw/If/For: path segments
   uint8_t npath = 0;
   // Resolution plan cache (per case; templates are recompiled per case).
@@ -2651,6 +2649,9 @@ static bool compileTemplate(Arena* ar, Str name, Str src, Template& out,
       Op op;
       op.kind = Op::Text;
       op.text = src.substr(textStart, end - textStart);
+      Buf jb;
+      appendJsonEscaped(jb, op.text);
+      op.escText = ar->dup(jb.view());
       emit(op);
     }
   };
@@ -3164,10 +3165,180 @@ static void appendTextOfEscaped(Buf& out, const Val* v) {
   }
 }
 
+// HTML-escape + JSON-escape fused (stream mode): one pass over a Var
+// value. Equal to appendEscaped followed by appendJsonEscaped: the HTML
+// entities contain no JSON-special bytes, and \ / controls / WTF-8
+// surrogates take their JSON escapes.
+static const char kCtrlU2[32][7] = {
+    "\\u0000", "\\u0001", "\\u0002", "\\u0003", "\\u0004", "\\u0005",
+    "\\u0006", "\\u0007", "\\u0008", "\\u0009", "\\u000a", "\\u000b",
+    "\\u000c", "\\u000d", "\\u000e", "\\u000f", "\\u0010", "\\u0011",
+    "\\u0012", "\\u0013", "\\u0014", "\\u0015", "\\u0016", "\\u0017",
+    "\\u0018", "\\u0019", "\\u001a", "\\u001b", "\\u001c", "\\u001d",
+    "\\u001e", "\\u001f"};
+static inline void appendEscapedJsonByte(Buf& out, const uint8_t* p, size_t n, size_t j) {
+  uint8_t c = p[j];
+  switch (c) {
+    case '&': out.append("&amp;"); break;
+    case '<': out.append("&lt;"); break;
+    case '>': out.append("&gt;"); break;
+    case '"': out.append("&quot;"); break;
+    case '\'': out.append("&#39;"); break;
+    case '\\': out.append("\\\\"); break;
+    case 8: out.append("\\b"); break;
+    case 9: out.append("\\t"); break;
+    case 10: out.append("\\n"); break;
+    case 12: out.append("\\f"); break;
+    case 13: out.append("\\r"); break;
+    default:
+      if (c < 0x20) out.append(kCtrlU2[c], 6);
+      else if (c == 0xED && j + 2 < n && (p[j + 1] & 0xF0) == 0xA0 &&
+               (p[j + 2] & 0xC0) == 0x80) {
+        uint32_t cp = ((c & 0x0F) << 12) | ((p[j + 1] & 0x3F) << 6) | (p[j + 2] & 0x3F);
+        char tmp[8];
+        tmp[0] = '\\'; tmp[1] = 'u';
+        tmp[2] = "0123456789abcdef"[(cp >> 12) & 0xF];
+        tmp[3] = "0123456789abcdef"[(cp >> 8) & 0xF];
+        tmp[4] = "0123456789abcdef"[(cp >> 4) & 0xF];
+        tmp[5] = "0123456789abcdef"[cp & 0xF];
+        out.append(tmp, 6);
+      } else {
+        out.push((char)c);
+      }
+      break;
+  }
+}
+__attribute__((target("avx2"))) static void appendEscapedJsonAVX2(Buf& out, Str s) {
+  const uint8_t* p = (const uint8_t*)s.p;
+  size_t n = s.n;
+  out.reserve(n * 6 + 16);
+  char* w = out.data + out.len;
+  auto flushLen = [&]() { out.len = (size_t)(w - out.data); };
+  size_t i = 0;
+  const __m256i q = _mm256_set1_epi8('"');
+  const __m256i bs = _mm256_set1_epi8('\\');
+  const __m256i amp = _mm256_set1_epi8('&');
+  const __m256i lt = _mm256_set1_epi8('<');
+  const __m256i gt = _mm256_set1_epi8('>');
+  const __m256i ap = _mm256_set1_epi8('\'');
+  const __m256i bias = _mm256_set1_epi8((char)0x80);
+  const __m256i lt20 = _mm256_set1_epi8((char)0xA0);
+  const __m256i hiED = _mm256_set1_epi8((char)0xED);
+  size_t lim = n & ~(size_t)31;
+  for (; i < lim;) {
+    __m256i x = _mm256_loadu_si256((const __m256i*)(p + i));
+    __m256i m = _mm256_or_si256(_mm256_cmpeq_epi8(x, q), _mm256_cmpeq_epi8(x, bs));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(x, amp));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(x, lt));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(x, gt));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(x, ap));
+    __m256i xb = _mm256_xor_si256(x, bias);
+    m = _mm256_or_si256(m, _mm256_cmpgt_epi8(lt20, xb));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(x, hiED));
+    uint32_t mask = (uint32_t)_mm256_movemask_epi8(m);
+    if (!mask) {
+      std::memcpy(w, p + i, 32);
+      w += 32;
+      i += 32;
+      continue;
+    }
+    // Slow lane: copy clean runs, escape flagged bytes. Switch on the
+    // flagged byte; a 0xED surrogate consumes 3 bytes (handled by
+    // tracking the output position, not by masking the mask).
+    size_t pos = i;
+    uint32_t mm = mask;
+    // Build the output through a temporary Buf view: simplest correct
+    // approach is to flush and use Buf appends for flagged chunks.
+    flushLen();
+    while (mm) {
+      unsigned b = (unsigned)__builtin_ctz(mm);
+      size_t j = i + b;
+      if (j > pos) out.append((const char*)p + pos, j - pos);
+      uint8_t c = p[j];
+      if (c == 0xED && j + 2 < n && (p[j + 1] & 0xF0) == 0xA0 &&
+          (p[j + 2] & 0xC0) == 0x80) {
+        appendEscapedJsonByte(out, p, n, j);
+        pos = j + 3;
+      } else {
+        appendEscapedJsonByte(out, p, n, j);
+        pos = j + 1;
+      }
+      mm &= mm - 1;
+    }
+    if (pos < i + 32) out.append((const char*)p + pos, i + 32 - pos);
+    // Re-establish the raw-write cursor after Buf appends.
+    w = out.data + out.len;
+    i += 32;
+  }
+  flushLen();
+  for (; i < n; i++) {
+    uint8_t c = p[i];
+    if (c == '&' || c == '<' || c == '>' || c == '"' || c == '\'' || c == '\\' ||
+        c < 0x20 || c == 0xED) {
+      appendEscapedJsonByte(out, p, n, i);
+      if (c == 0xED && i + 2 < n && (p[i + 1] & 0xF0) == 0xA0 &&
+          (p[i + 2] & 0xC0) == 0x80)
+        i += 2;
+    } else {
+      out.push((char)c);
+    }
+  }
+}
+static inline void appendEscapedJson(Buf& out, Str s) {
+  if (cpuHasAVX2()) appendEscapedJsonAVX2(out, s);
+  else {
+    const uint8_t* p = (const uint8_t*)s.p;
+    for (size_t i = 0; i < s.n; i++) {
+      uint8_t c = p[i];
+      if (c == '&' || c == '<' || c == '>' || c == '"' || c == '\'' || c == '\\' ||
+          c < 0x20 || c == 0xED) {
+        appendEscapedJsonByte(out, p, s.n, i);
+        if (c == 0xED && i + 2 < s.n && (p[i + 1] & 0xF0) == 0xA0 &&
+            (p[i + 2] & 0xC0) == 0x80)
+          i += 2;
+      } else {
+        out.push((char)c);
+      }
+    }
+  }
+}
+static void appendTextOfEscapedJson(Buf& out, const Val* v) {
+  if (!v) return;
+  switch (v->type) {
+    case Val::Str: appendEscapedJson(out, v->s); break;
+    case Val::Int: out.appendInt(v->i); break;
+    case Val::Dbl: appendJsNum(out, v->d); break;
+    case Val::Bool: out.append(v->b ? "true" : "false"); break;
+    case Val::Arr:
+      for (uint32_t k = 0; k < v->arr.n; k++) {
+        if (k) out.append(", ");
+        appendTextOfEscapedJson(out, &v->arr.items[k]);
+      }
+      break;
+    default: break;
+  }
+}
+static void appendTextOfJson(Buf& out, const Val* v) {
+  if (!v) return;
+  switch (v->type) {
+    case Val::Str: appendJsonEscaped(out, v->s); break;
+    case Val::Int: out.appendInt(v->i); break;
+    case Val::Dbl: appendJsNum(out, v->d); break;
+    case Val::Bool: out.append(v->b ? "true" : "false"); break;
+    case Val::Arr:
+      for (uint32_t k = 0; k < v->arr.n; k++) {
+        if (k) out.append(", ");
+        appendTextOfJson(out, &v->arr.items[k]);
+      }
+      break;
+    default: break;
+  }
+}
+
 // Execute template `startIdx` into `out`. `frames` holds the root frame
 // at index 0 (nframes = 1 on entry); loop frames are pushed/popped here.
 static void execTemplate(Template* tpls, int32_t startIdx, Frame* frames, uint32_t& nframes,
-                         Buf& out) {
+                         Buf& out, bool stream) {
   ProfTimer _pt("tpl.exec");
   struct Call {
     int32_t tmpl;
@@ -3187,18 +3358,20 @@ static void execTemplate(Template* tpls, int32_t startIdx, Frame* frames, uint32
     Op& op = t.ops[c.pc];
     switch (op.kind) {
       case Op::Text:
-        out.append(op.text);
+        out.append(stream ? op.escText : op.text);
         c.pc++;
         break;
       case Op::Var: {
         const Val* v = resolvePlanned(&op, frames, nframes, &scratch);
-        appendTextOfEscaped(out, v);
+        if (stream) appendTextOfEscapedJson(out, v);
+        else appendTextOfEscaped(out, v);
         c.pc++;
         break;
       }
       case Op::Raw: {
         const Val* v = resolvePlanned(&op, frames, nframes, &scratch);
-        appendTextOf(out, v);
+        if (stream) appendTextOfJson(out, v);
+        else appendTextOf(out, v);
         c.pc++;
         break;
       }
@@ -3316,7 +3489,7 @@ static void jsSliceRange(int64_t n, double start, bool hasEnd, double end, int64
 }
 
 // The words of a body: runs of characters other than JS \s whitespace.
-static int64_t wordsOf(Str text) {
+static int64_t wordsOfScalar(Str text) {
   int64_t n = 0;
   bool inWord = false;
   const uint8_t* p = (const uint8_t*)text.p;
@@ -3335,6 +3508,92 @@ static int64_t wordsOf(Str text) {
     }
   }
   return n;
+}
+
+// Word count (JS \s word boundaries) with an AVX2 fast path for pure-ASCII
+// 32-byte chunks: a word starts at a non-WS byte whose predecessor is WS
+// (or the start, when not already in a word). Chunks holding any byte
+// >= 0x80 fall back to the scalar decoder (multibyte WS code points are
+// rare in practice bodies; the scalar path keeps them exact).
+__attribute__((target("avx2"))) static int64_t wordsOfAVX2(Str text) {
+  const uint8_t* p = (const uint8_t*)text.p;
+  size_t n = text.n;
+  int64_t cnt = 0;
+  bool inWord = false;
+  // Low-nibble table: WS nibbles for bytes <= 0x20 are {0,9,A,B,C,D}
+  // (0x00/0x10 share nibble 0 but are not WS; excluded below).
+  const __m256i wsNib = _mm256_setr_epi8(
+      (char)0xFF, 0, 0, 0, 0, 0, 0, 0, 0, (char)0xFF, (char)0xFF, (char)0xFF,
+      (char)0xFF, (char)0xFF, 0, 0, (char)0xFF, 0, 0, 0, 0, 0, 0, 0, 0,
+      (char)0xFF, (char)0xFF, (char)0xFF, (char)0xFF, (char)0xFF, 0, 0);
+  const __m256i nibMask = _mm256_set1_epi8(0x0F);
+  const __m256i bias = _mm256_set1_epi8((char)0x80);
+  const __m256i le20 = _mm256_set1_epi8((char)0xA1);  // (b^0x80) < 0xA1 <=> b <= 0x20
+  const __m256i zero = _mm256_setzero_si256();
+  const __m256i b10 = _mm256_set1_epi8(0x10);
+  size_t i = 0;
+  while (i + 32 <= n) {
+    __m256i x = _mm256_loadu_si256((const __m256i*)(p + i));
+    if (_mm256_movemask_epi8(x) != 0) {
+      // Scalar chunk (multibyte present): decode code points until the
+      // chunk end is reached (a sequence may straddle the boundary).
+      size_t chunkEnd = i + 32;
+      const uint8_t* e = p + n;
+      while (i < chunkEnd) {
+        uint32_t cp;
+        if (p[i] < 0x80) cp = p[i++];
+        else {
+          const uint8_t* q = p + i;
+          cp = utf8Decode(q, e);
+          i = (size_t)(q - p);
+        }
+        if (isWSCodePoint(cp)) inWord = false;
+        else if (!inWord) {
+          inWord = true;
+          cnt++;
+        }
+      }
+      continue;
+    }
+    __m256i xb = _mm256_xor_si256(x, bias);
+    __m256i isLe20 = _mm256_cmpgt_epi8(le20, xb);  // byte <= 0x20
+    __m256i nib = _mm256_and_si256(x, nibMask);
+    __m256i isWsNib = _mm256_shuffle_epi8(wsNib, nib);
+    __m256i isWs = _mm256_and_si256(isLe20, isWsNib);
+    // Exclude 0x00 and 0x10 (nibble 0, not WS).
+    __m256i is00 = _mm256_cmpeq_epi8(x, zero);
+    __m256i is10 = _mm256_cmpeq_epi8(x, b10);
+    isWs = _mm256_andnot_si256(_mm256_or_si256(is00, is10), isWs);
+    uint32_t wsMask = (uint32_t)_mm256_movemask_epi8(isWs);
+    uint32_t starts = (~wsMask) & ((wsMask << 1) | (inWord ? 0u : 1u));
+    cnt += __builtin_popcount(starts);
+    inWord = (wsMask & 0x80000000u) == 0;
+    i += 32;
+  }
+  // Scalar tail.
+  {
+    const uint8_t* e = p + n;
+    while (i < n) {
+      uint32_t cp;
+      if (p[i] < 0x80) cp = p[i++];
+      else {
+        const uint8_t* q = p + i;
+        cp = utf8Decode(q, e);
+        i = (size_t)(q - p);
+      }
+      if (isWSCodePoint(cp)) inWord = false;
+      else if (!inWord) {
+        inWord = true;
+        cnt++;
+      }
+    }
+  }
+  return cnt;
+}
+
+static int64_t wordsOf(Str text) {
+  if (cpuHasAVX2()) return wordsOfAVX2(text);
+  return wordsOfScalar(text);
 }
 
 // One case's output: an ordered list of (path, text) pairs.
@@ -3374,7 +3633,7 @@ struct Emitter {
   bool first = true;
   Str* paths = nullptr;  // stream mode: emitted paths (for has())
   uint32_t npaths = 0, cappaths = 0;
-  void add(Arena* ar, Str path, Str text) {
+  void add(Arena* ar, Str path, Str text, bool preEscaped = false) {
     if (collect) {
       collect->add(ar, path, text);
       return;
@@ -3390,7 +3649,15 @@ struct Emitter {
     first = false;
     appendJsonString(*out, path);
     out->push(':');
-    appendJsonString(*out, text);
+    if (preEscaped) {
+      // Stream mode: the text is already JSON-escaped (template TEXT was
+      // pre-escaped at compile, Var fused, Raw escaped inline).
+      out->push('"');
+      out->append(text);
+      out->push('"');
+    } else {
+      appendJsonString(*out, text);
+    }
   }
   bool has(Str path) const {
     if (collect) return collect->has(path);
@@ -3891,9 +4158,7 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
                Val::str(summaryV && summaryV->type == Val::Str ? summaryV->s : Str())};
     kv[5] = KV{S("excerpt"), Val::str(s.excerpt)};
     kv[6] = KV{S("reading_minutes"), Val::integer(minutes)};
-    Val* tagArr = ar->allocArr<Val>(s.ntagLinks ? s.ntagLinks : 1);
-    for (uint32_t q = 0; q < s.ntagLinks; q++) tagArr[q] = s.tagLinks[q];
-    kv[7] = KV{S("tags"), Val::array(tagArr, s.ntagLinks)};
+    kv[7] = KV{S("tags"), Val::array(s.tagLinks, s.ntagLinks)};
     s.card = Val::object(kv, 8);
   }
   // site / allTags / recent (JS slice semantics).
@@ -3942,7 +4207,7 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
     frames[nframes].nvars = 3 + nExtra;
     nframes++;
     renderOut.reset();
-    execTemplate(tpls, ti, frames, nframes, renderOut);
+    execTemplate(tpls, ti, frames, nframes, renderOut, out.collect == nullptr);
     // Stream mode consumes the HTML immediately (emitter escapes it on
     // the spot), so skip the arena copy; collect mode (runOne) still
     // needs the dup because the string outlives this call.
@@ -3975,7 +4240,7 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
     Str html;
     if (render(s.layout, extra, 1, html)) {
       Str outPath = ar->cat({s.outDir, S("/index.html")});
-      out.add(ar, outPath, html);
+      out.add(ar, outPath, html, true);
     }
   }
   // Index pages.
@@ -4016,11 +4281,11 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
     Str html;
     if (render(S("index"), extra, 2, html)) {
       if (k == 1) {
-        out.add(ar, S("index.html"), html);
+        out.add(ar, S("index.html"), html, true);
       } else {
         char nb[24];
         int nn = std::snprintf(nb, sizeof nb, "%lld", (long long)k);
-        out.add(ar, ar->cat({S("page/"), Str(nb, (uint32_t)nn), S("/index.html")}), html);
+        out.add(ar, ar->cat({S("page/"), Str(nb, (uint32_t)nn), S("/index.html")}), html, true);
       }
     }
   }
@@ -4040,13 +4305,13 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
     KV extra[1] = {KV{S("tag"), tag}};
     Str html;
     if (render(S("tag"), extra, 1, html)) {
-      out.add(ar, ar->cat({S("tags/"), t.slug, S("/index.html")}), html);
+      out.add(ar, ar->cat({S("tags/"), t.slug, S("/index.html")}), html, true);
     }
   }
   // Tags index page.
   {
     Str html;
-    if (render(S("tags"), nullptr, 0, html)) out.add(ar, S("tags/index.html"), html);
+    if (render(S("tags"), nullptr, 0, html)) out.add(ar, S("tags/index.html"), html, true);
   }
   // Statics (shadowed when a built page already has the path; a static
   // named "__proto__" is dropped silently, as the JS assignment is).
