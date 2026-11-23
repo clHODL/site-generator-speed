@@ -1854,9 +1854,56 @@ static inline void appendEscapeEntity(Buf& out, char c) {
   }
 }
 
+// Is the byte at j escaped? Escape pairs ('\\' + ESCAPABLE) are consumed
+// left-to-right; a maximal run of b backslashes pairs up internally, so
+// the byte after it is escaped iff b is odd (and the byte is escapable —
+// the only callers check '*' and ']', both escapable). The char before
+// the run is not '\\' (maximal run), so it cannot have escaped the
+// run's first backslash.
+static inline bool isEscapedPos(Str s, size_t j) {
+  size_t b = 0;
+  while (j > b && s.p[j - 1 - b] == '\\') b++;
+  return (b & 1) != 0;
+}
+
+// Next unescaped "**" at/after `from` (AVX2 scan for '*', escape check
+// per candidate). Identical results to the scalar loop it replaces:
+// the scalar loop consumes escape pairs as units and checks every other
+// position; an escaped '*' resumes at the next byte, an unescaped '*'
+// without a '*' after it resumes at the next byte too.
+static long findUnescapedStar2(Str s, size_t from) {
+  const uint8_t star = '*';
+  size_t pos = from;
+  while (pos + 1 < s.n) {
+    size_t rel = findInSet((const uint8_t*)s.p + pos, s.n - pos, &star, 1);
+    if (rel >= s.n - pos) return -1;
+    size_t j = pos + rel;
+    if (j + 1 >= s.n) return -1;
+    if (s.p[j + 1] == '*' && !isEscapedPos(s, j)) return (long)j;
+    pos = j + 1;
+  }
+  return -1;
+}
+
+// Next unescaped ']' at/after `from`.
+static long findUnescapedBracket(Str s, size_t from) {
+  const uint8_t br = ']';
+  size_t pos = from;
+  while (pos < s.n) {
+    size_t rel = findInSet((const uint8_t*)s.p + pos, s.n - pos, &br, 1);
+    if (rel >= s.n - pos) return -1;
+    size_t j = pos + rel;
+    if (!isEscapedPos(s, j)) return (long)j;
+    pos = j + 1;
+  }
+  return -1;
+}
+
 // The first index >= from where `s` holds `what` outside a backslash
 // escape, or -1. An escape pair (\ + ESCAPABLE) is skipped as a unit.
 static long findUnescaped(Str s, Str what, size_t from) {
+  if (strEq(what, S("**"))) return findUnescapedStar2(s, from);
+  if (strEq(what, S("]"))) return findUnescapedBracket(s, from);
   size_t wl = what.n;
   if (wl == 0) return (long)from;
   for (size_t j = from; j + wl <= s.n; j++) {
@@ -1870,17 +1917,22 @@ static long findUnescaped(Str s, Str what, size_t from) {
 }
 
 // The first single * from `from` (one whose run is not **), outside an
-// escape, or -1.
+// escape, or -1. Pairing is greedy left-to-right exactly like the scalar
+// loop: a '*' followed by '*' consumes BOTH (pos += 2); an escaped '*'
+// consumes just itself (pos += 1).
 static long findSingleStar(Str s, size_t from) {
-  for (size_t j = from; j < s.n; j++) {
-    char c = s.p[j];
-    if (c == '\\' && j + 1 < s.n && isEscapable(s.p[j + 1])) {
-      j++;
+  const uint8_t star = '*';
+  size_t pos = from;
+  while (pos < s.n) {
+    size_t rel = findInSet((const uint8_t*)s.p + pos, s.n - pos, &star, 1);
+    if (rel >= s.n - pos) return -1;
+    size_t j = pos + rel;
+    if (isEscapedPos(s, j)) {
+      pos = j + 1;
       continue;
     }
-    if (c != '*') continue;
     if (j + 1 < s.n && s.p[j + 1] == '*') {
-      j++;
+      pos = j + 2;
       continue;
     }
     return (long)j;
@@ -2124,6 +2176,7 @@ static MdOut renderMarkdown(Arena* ar, Str body, InlineCtx& ctx) {
   ProfTimer _pt("md.render");
   // Line table: body.split('\n') (JS semantics: a trailing '\n' yields
   // a final empty line; "" yields one empty line).
+  auto _tLines = std::chrono::steady_clock::now();
   Str* lines = nullptr;
   uint32_t nlines = 0, capLines = 0;
   {
@@ -2141,6 +2194,7 @@ static MdOut renderMarkdown(Arena* ar, Str body, InlineCtx& ctx) {
       pos = nl + 1;
     }
   }
+  Prof::add("md.lines", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tLines).count());
   // Kind cache (classified once per line).
   uint8_t* kinds = ar->allocArr<uint8_t>(nlines);
   std::memset(kinds, LK_UNKNOWN, nlines);
@@ -2426,6 +2480,22 @@ struct Op {
   Str text;            // Text: literal
   Str* path = nullptr; // Var/Raw/If/For: path segments
   uint8_t npath = 0;
+  // Resolution plan cache (per case; templates are recompiled per case).
+  // On first execution the slow walk records each step as a direct
+  // indexed access; later executions replay it, validating by re-checking
+  // the keys at the recorded indices (keys are unique in every object
+  // the templates can see, so a match proves the value is the right one)
+  // and that no frame above the recorded one shadows segment 0.
+  // Falls back to the slow walk on any validation failure.
+  struct PlanStep {
+    uint8_t kind;  // 0=rootKV, 1=objKV, 2=arrLen, 3=arrIdx, 4=loopField, 5=forElem, 6=loopRec
+    uint32_t idx;  // KV index / array index / loop field id
+  };
+  PlanStep plan[6];
+  uint8_t nplan = 0;
+  uint8_t planDepth = 0;  // nframes the plan was recorded at
+  int8_t planFrame = -1;  // frame index of the segment-0 match
+  bool planOk = false;
   bool neg = false;    // If: "not"
   int32_t jump = -1;   // If: else_pc or end_pc; Else: end_pc; For: end_pc
   int32_t elsePc = -1; // If: else op index (-1 = no else)
@@ -2868,6 +2938,205 @@ static const Val* resolvePath(Frame* frames, uint32_t nframes, Str* path, uint8_
   return v;
 }
 
+// Recording resolver: same walk as resolvePath, but records each step
+// into op->plan. Returns the value (or nullptr) exactly like resolvePath.
+static const Val* resolvePathRec(Op* op, Frame* frames, uint32_t nframes,
+                                 Str* path, uint8_t npath, Val* scratch) {
+  if (npath == 0 || npath > 6) return nullptr;
+  const Val* v = nullptr;
+  int8_t foundFrame = -1;
+  uint8_t step0kind = 0;
+  uint32_t step0idx = 0;
+  for (int32_t f = (int32_t)nframes - 1; f >= 0; f--) {
+    Frame& fr = frames[f];
+    if (fr.isFor) {
+      if (strEq(path[0], S("loop"))) {
+        v = &fr.loopVal;
+        foundFrame = (int8_t)f;
+        step0kind = 6;
+        break;
+      }
+      if (strEq(path[0], fr.elemName)) {
+        v = fr.elem;
+        foundFrame = (int8_t)f;
+        step0kind = 5;
+        break;
+      }
+      continue;
+    }
+    for (int32_t q = (int32_t)fr.nvars - 1; q >= 0; q--)
+      if (strEq(fr.vars[q].key, path[0])) {
+        v = &fr.vars[q].val;
+        foundFrame = (int8_t)f;
+        step0kind = 0;
+        step0idx = (uint32_t)q;
+        break;
+      }
+    if (v) break;
+  }
+  if (!v) return nullptr;
+  op->plan[0] = Op::PlanStep{step0kind, step0idx};
+  uint8_t nsteps = 1;
+  for (uint8_t k = 1; k < npath; k++) {
+    const Val* next = nullptr;
+    uint8_t sk = 0;
+    uint32_t si = 0;
+    if (v->type == Val::Obj) {
+      const Val* fnd = nullptr;
+      uint32_t fi = 0;
+      for (uint32_t q = 0; q < v->obj.n; q++)
+        if (strEq(v->obj.items[q].key, path[k])) {
+          fnd = &v->obj.items[q].val;
+          fi = q;
+          break;
+        }
+      if (!fnd) return nullptr;
+      next = fnd;
+      sk = 1;
+      si = fi;
+    } else if (v->type == Val::Arr) {
+      if (strEq(path[k], S("length"))) {
+        *scratch = Val::integer(v->arr.n);
+        next = scratch;
+        sk = 2;
+      } else if (path[k].n > 0) {
+        bool digits = true;
+        for (uint32_t q = 0; q < path[k].n; q++)
+          if (path[k].p[q] < '0' || path[k].p[q] > '9') {
+            digits = false;
+            break;
+          }
+        if (digits && !(path[k].n > 1 && path[k].p[0] == '0')) {
+          uint64_t idx = 0;
+          for (uint32_t q = 0; q < path[k].n; q++)
+            idx = idx * 10 + (uint64_t)(path[k].p[q] - '0');
+          if (idx >= v->arr.n) return nullptr;
+          next = &v->arr.items[idx];
+          sk = 3;
+          si = (uint32_t)idx;
+        } else {
+          return nullptr;
+        }
+      } else {
+        return nullptr;
+      }
+    } else if (v->type == Val::Loop) {
+      if (strEq(path[k], S("index"))) {
+        *scratch = Val::integer((int64_t)v->loop.idx + 1);
+        next = scratch;
+        sk = 4;
+        si = 0;
+      } else if (strEq(path[k], S("first"))) {
+        *scratch = Val::boolean(v->loop.idx == 0);
+        next = scratch;
+        sk = 4;
+        si = 1;
+      } else if (strEq(path[k], S("last"))) {
+        *scratch = Val::boolean(v->loop.idx + 1 == v->loop.len);
+        next = scratch;
+        sk = 4;
+        si = 2;
+      } else if (strEq(path[k], S("length"))) {
+        *scratch = Val::integer(v->loop.len);
+        next = scratch;
+        sk = 4;
+        si = 3;
+      } else {
+        return nullptr;
+      }
+    } else {
+      return nullptr;
+    }
+    op->plan[nsteps++] = Op::PlanStep{sk, si};
+    v = next;
+  }
+  op->nplan = nsteps;
+  op->planDepth = (uint8_t)nframes;
+  op->planFrame = foundFrame;
+  op->planOk = true;
+  return v;
+}
+
+// Planned resolution: replay op->plan with validation, or record it.
+// Behavior is identical to resolvePath in every case.
+static const Val* resolvePlanned(Op* op, Frame* frames, uint32_t nframes,
+                                 Val* scratch) {
+  Str* path = op->path;
+  uint8_t npath = op->npath;
+  if (!op->planOk || op->nplan == 0) {
+    const Val* r = resolvePathRec(op, frames, nframes, path, npath, scratch);
+    if (r) return r;
+    return resolvePath(frames, nframes, path, npath, scratch);
+  }
+  // Validate + replay.
+  if (nframes != op->planDepth || op->planFrame < 0 ||
+      (uint32_t)op->planFrame >= nframes)
+    goto slow;
+  {
+    // No frame above the recorded one may shadow segment 0.
+    for (uint32_t g = (uint32_t)op->planFrame + 1; g < nframes; g++) {
+      Frame& fr = frames[g];
+      if (!fr.isFor) goto slow;  // only frame 0 is a root frame
+      if (strEq(path[0], S("loop")) || strEq(path[0], fr.elemName)) goto slow;
+    }
+    const Val* v = nullptr;
+    Op::PlanStep s0 = op->plan[0];
+    Frame& fr = frames[op->planFrame];
+    if (s0.kind == 0) {  // rootKV
+      if (fr.isFor || s0.idx >= fr.nvars ||
+          !strEq(fr.vars[s0.idx].key, path[0]))
+        goto slow;
+      v = &fr.vars[s0.idx].val;
+    } else if (s0.kind == 5) {  // forElem
+      if (!fr.isFor || !strEq(path[0], fr.elemName)) goto slow;
+      v = fr.elem;
+    } else if (s0.kind == 6) {  // loopRec
+      if (!fr.isFor || !strEq(path[0], S("loop"))) goto slow;
+      v = &fr.loopVal;
+    } else {
+      goto slow;
+    }
+    for (uint8_t k = 1; k < op->nplan; k++) {
+      Op::PlanStep st = op->plan[k];
+      if (st.kind == 1) {  // objKV
+        if (v->type != Val::Obj || st.idx >= v->obj.n ||
+            !strEq(v->obj.items[st.idx].key, path[k]))
+          goto slow;
+        v = &v->obj.items[st.idx].val;
+      } else if (st.kind == 2) {  // arrLen
+        if (v->type != Val::Arr) goto slow;
+        *scratch = Val::integer(v->arr.n);
+        v = scratch;
+      } else if (st.kind == 3) {  // arrIdx
+        if (v->type != Val::Arr || st.idx >= v->arr.n) goto slow;
+        v = &v->arr.items[st.idx];
+      } else if (st.kind == 4) {  // loopField
+        if (v->type != Val::Loop) goto slow;
+        if (st.idx == 0)
+          *scratch = Val::integer((int64_t)v->loop.idx + 1);
+        else if (st.idx == 1)
+          *scratch = Val::boolean(v->loop.idx == 0);
+        else if (st.idx == 2)
+          *scratch = Val::boolean(v->loop.idx + 1 == v->loop.len);
+        else
+          *scratch = Val::integer(v->loop.len);
+        v = scratch;
+      } else {
+        goto slow;
+      }
+    }
+    // The plan covers all npath segments only when nplan == npath; a
+    // recorded plan always does (resolvePathRec records every segment).
+    return v;
+  }
+slow:
+  {
+    const Val* r = resolvePathRec(op, frames, nframes, path, npath, scratch);
+    if (r) return r;
+    return resolvePath(frames, nframes, path, npath, scratch);
+  }
+}
+
 // textOf with HTML escaping (for {{ }}).
 static void appendTextOfEscaped(Buf& out, const Val* v) {
   if (!v) return;
@@ -2922,19 +3191,19 @@ static void execTemplate(Template* tpls, int32_t startIdx, Frame* frames, uint32
         c.pc++;
         break;
       case Op::Var: {
-        const Val* v = resolvePath(frames, nframes, op.path, op.npath, &scratch);
+        const Val* v = resolvePlanned(&op, frames, nframes, &scratch);
         appendTextOfEscaped(out, v);
         c.pc++;
         break;
       }
       case Op::Raw: {
-        const Val* v = resolvePath(frames, nframes, op.path, op.npath, &scratch);
+        const Val* v = resolvePlanned(&op, frames, nframes, &scratch);
         appendTextOf(out, v);
         c.pc++;
         break;
       }
       case Op::If: {
-        const Val* v = resolvePath(frames, nframes, op.path, op.npath, &scratch);
+        const Val* v = resolvePlanned(&op, frames, nframes, &scratch);
         bool tr = truthy(v);
         if (op.neg) tr = !tr;
         c.pc = tr ? c.pc + 1 : (uint32_t)op.jump;
@@ -2947,7 +3216,7 @@ static void execTemplate(Template* tpls, int32_t startIdx, Frame* frames, uint32
         c.pc++;
         break;
       case Op::For: {
-        const Val* v = resolvePath(frames, nframes, op.path, op.npath, &scratch);
+        const Val* v = resolvePlanned(&op, frames, nframes, &scratch);
         if (v && v->type == Val::Arr && v->arr.n > 0) {
           Frame& f = frames[nframes++];
           f = Frame();
