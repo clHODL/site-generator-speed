@@ -343,11 +343,6 @@ function lineKind(line) {
   return K_PARA;
 }
 
-/** Whether `line` ends a paragraph: blank, fence, heading or thematic break. */
-function endsParagraph(line) {
-  const k = lineKind(line);
-  return k === K_BLANK || k === K_FENCE || k === K_HEADING || k === K_HR;
-}
 
 /** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
 function findUnescaped(s, what, from) {
@@ -472,9 +467,13 @@ function renderMarkdown(src, env) {
   let excerpt = null;
   const ids = new Set();
   let i = 0;
+  // Each line's kind, classified once: the main loop, the paragraph-end
+  // check and the list loop used to re-classify the same line up to 3x.
+  const kinds = new Array(n);
+  const kindAt = (j) => (kinds[j] === undefined ? (kinds[j] = lineKind(lines[j])) : kinds[j]);
   while (i < n) {
     const line = lines[i];
-    const kind = lineKind(line);
+    const kind = kindAt(i);
     if (kind === K_BLANK) {
       i++;
       continue;
@@ -486,8 +485,7 @@ function renderMarkdown(src, env) {
       while (i < n && !isFenceClose(lines[i])) body.push(lines[i++]);
       i++;
       const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
-      let code = '';
-      for (let q = 0; q < body.length; q++) code += escapeHtml(body[q]) + '\n';
+      const code = body.length === 0 ? '' : body.map(escapeHtml).join('\n') + '\n';
       blocks.push(`<pre><code${cls}>${code}</code></pre>`);
       continue;
     }
@@ -527,7 +525,7 @@ function renderMarkdown(src, env) {
       const items = [];
       while (i < n) {
         const l = lines[i];
-        if (lineKind(l) !== K_LIST) {
+        if (kindAt(i) !== K_LIST) {
           // A continuation line: two or more spaces then a non-space.
           if (isContinued(l)) {
             items[items.length - 1].push(trimST(l));
@@ -559,7 +557,11 @@ function renderMarkdown(src, env) {
     // Paragraph.
     const body = [trimST(line)];
     i++;
-    while (i < n && !endsParagraph(lines[i])) body.push(trimST(lines[i++]));
+    while (i < n) {
+      const k = kindAt(i);
+      if (k === K_BLANK || k === K_FENCE || k === K_HEADING || k === K_HR) break;
+      body.push(trimST(lines[i++]));
+    }
     const text = body.join('\n');
     const html = inline(text, env);
     if (excerpt === null) excerpt = html;
@@ -873,13 +875,22 @@ export function run(input) {
   for (const s of sources) {
     const dir = dirOf(s.path);
     const dirParts = dir === '' ? [] : dir.split('/');
+    // Resolved link targets, cached per source: the same rel repeats
+    // from many pages in one directory.
+    const resolved = new Map();
     const env = {
       link: (target) => {
         if (SCHEME_RE.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dirParts, rel);
+        let path;
+        if (rel === '') path = null;
+        else if (resolved.has(rel)) path = resolved.get(rel);
+        else {
+          path = resolvePath(dirParts, rel);
+          resolved.set(rel, path);
+        }
         if (path !== null && bySource.has(path)) return `${bySource.get(path).url}${frag}`;
         if (path !== null && staticPaths.has(path)) return `${base}/${path}${frag}`;
         broken.add(`broken-link ${s.path} -> ${target}`);
@@ -943,8 +954,11 @@ export function run(input) {
     reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
     tags: s.tagRefs.map((t) => (t.link ??= { name: t.name, slug: t.slug, url: t.url })),
   });
+  // One card per source, computed once: pageOf used to recompute cardOf for
+  // every source — and wordsOf over its whole body a second time for posts.
+  const cards = new Map(sources.map((s) => [s, cardOf(s)]));
   const pageOf = (s) => ({
-    ...cardOf(s),
+    ...cards.get(s),
     slug: s.slug,
     content: s.html,
     toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
@@ -952,7 +966,6 @@ export function run(input) {
     older: linkOf(s.older ?? null),
     is_post: s.post,
   });
-  const cards = new Map(posts.map((p) => [p, cardOf(p)]));
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
