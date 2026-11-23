@@ -3174,6 +3174,7 @@ static bool runCase(Arena* ar, const Val& input, CaseOut& out) {
     }
   }
 
+  auto _t2 = std::chrono::steady_clock::now();
   // ---- 2. Front matter + refusal checks.
   Source* kept = ar->allocArr<Source>(nsources ? nsources : 1);
   uint32_t nkept = 0;
@@ -3225,6 +3226,8 @@ static bool runCase(Arena* ar, const Val& input, CaseOut& out) {
   sources = kept;
   nsources = nkept;
 
+  Prof::add("step2.fm", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t2).count());
+  auto _t3 = std::chrono::steady_clock::now();
   // ---- 3. Permalinks.
   // taken sets per directory (root starts with RESERVED).
   struct TakenSet {
@@ -3307,6 +3310,7 @@ static bool runCase(Arena* ar, const Val& input, CaseOut& out) {
     s.url = ar->cat({base, S("/"), s.outDir, S("/")});
   }
 
+  Prof::add("step3.links", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t3).count());
   // ---- 4. Markdown (links resolved against the source paths + statics).
   InlineCtx::PageLink* pageLinks = ar->allocArr<InlineCtx::PageLink>(nsources ? nsources : 1);
   for (uint32_t i = 0; i < nsources; i++) {
@@ -3360,6 +3364,7 @@ static bool runCase(Arena* ar, const Val& input, CaseOut& out) {
     for (uint32_t q = 0; q < ctx.nbroken; q++) pushBroken(ctx.broken[q]);
   }
 
+  auto _t5 = std::chrono::steady_clock::now();
   // ---- 5. Collections: posts newest first, then by slug.
   uint32_t* postIdx = ar->allocArr<uint32_t>(nsources ? nsources : 1);
   uint32_t nposts = 0;
@@ -3380,6 +3385,8 @@ static bool runCase(Arena* ar, const Val& input, CaseOut& out) {
     sources[si].older = k + 1 == nposts ? -1 : (int32_t)postIdx[k + 1];
   }
 
+  Prof::add("step5.coll", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t5).count());
+  auto _t6 = std::chrono::steady_clock::now();
   // ---- 6. Tags, grouped by slug, named as first met in the posts' order.
   // Each source keeps its card's tag links directly (a TagObj's memoized
   // link, or a fresh {name, slug, url:''} for a synthetic tag).
@@ -3487,6 +3494,8 @@ static bool runCase(Arena* ar, const Val& input, CaseOut& out) {
     return cmpStr(a.slug, b.slug) < 0;
   });
 
+  Prof::add("step6.tags", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t6).count());
+  auto _t7 = std::chrono::steady_clock::now();
   // ---- 7. Layouts.
   // cardOf(s): one card per source, computed once.
   auto linkOf = [&](int32_t srcIdx) -> Val {
@@ -3686,6 +3695,8 @@ static bool runCase(Arena* ar, const Val& input, CaseOut& out) {
     }
   }
 
+  Prof::add("step7.rest", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t7).count());
+  auto _t8 = std::chrono::steady_clock::now();
   // ---- 8. The report.
   Str* lines = ar->allocArr<Str>(nreport + nBroken + 1);
   uint32_t nlines = 0;
@@ -3704,6 +3715,7 @@ static bool runCase(Arena* ar, const Val& input, CaseOut& out) {
     rb.append(lines[q]);
     rb.push('\n');
   }
+  Prof::add("step8.report", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t8).count());
   out.add(ar, S("build-report.txt"), ar->dup(rb.view()));
   return true;
 }
@@ -3858,6 +3870,7 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
     if (napi_get_value_string_utf8(env, argv[1], buf, sizeof buf, &len) == napi_ok && len > 0)
       outPath.assign(buf, len);
   }
+  auto _tRunAll = std::chrono::steady_clock::now();
   FILE* f = nullptr;
   {
     ProfTimer _ptF("file.read");
@@ -3938,6 +3951,7 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
     std::fclose(of);
   }
   std::free(buf);
+  Prof::add("runAll.body", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tRunAll).count());
   if (std::getenv("NATIVE_PROFILE")) Prof::print();
   // Fast exit: skip Node teardown (the winners' SYS_exit_group). The
   // answers file is already written and closed.
