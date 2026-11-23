@@ -963,14 +963,31 @@ struct JsonParser {
 // memcpy'd whole. WTF-8 surrogate sequences (ED A0..BF) are re-escaped
 // as \uXXXX (JSON.stringify behaviour).
 __attribute__((target("avx2"))) static void appendJsonEscapedAVX2(Buf& out, Str s) {
+  // Raw-pointer writes: one reserve up front (worst case 6x), then plain
+  // memcpy/pointer bumps — no per-run Buf::append/reserve overhead.
+  // Control chars use their 2-byte JSON escapes (\n etc.), never
+  // snprintf; other controls come from a static table. The old code ran
+  // snprintf("\u%04x") for EVERY newline (~150K of them in the HTML) and
+  // emitted 6 bytes per newline instead of 2.
+  static const char kCtrlU[32][7] = {
+      "\\u0000", "\\u0001", "\\u0002", "\\u0003", "\\u0004", "\\u0005",
+      "\\u0006", "\\u0007", "\\u0008", "\\u0009", "\\u000a", "\\u000b",
+      "\\u000c", "\\u000d", "\\u000e", "\\u000f", "\\u0010", "\\u0011",
+      "\\u0012", "\\u0013", "\\u0014", "\\u0015", "\\u0016", "\\u0017",
+      "\\u0018", "\\u0019", "\\u001a", "\\u001b", "\\u001c", "\\u001d",
+      "\\u001e", "\\u001f"};
   const uint8_t* p = (const uint8_t*)s.p;
   size_t n = s.n;
+  out.reserve(n * 6 + 16);  // true worst case (control -> 6 bytes);
+                            // raw writes below can never overrun the buffer.
+  char* w = out.data + out.len;
+  auto flushLen = [&]() { out.len = (size_t)(w - out.data); };
   size_t i = 0;
   const __m256i q = _mm256_set1_epi8('"');
   const __m256i bs = _mm256_set1_epi8('\\');
   const __m256i bias = _mm256_set1_epi8((char)0x80);
   const __m256i hiED = _mm256_set1_epi8((char)0xED);
-  const __m256i zero = _mm256_setzero_si256();
+  const __m256i lt20 = _mm256_set1_epi8((char)0xA0);
   size_t lim = n & ~(size_t)31;
   for (; i < lim;) {
     __m256i x = _mm256_loadu_si256((const __m256i*)(p + i));
@@ -978,70 +995,94 @@ __attribute__((target("avx2"))) static void appendJsonEscapedAVX2(Buf& out, Str 
     __m256i m2 = _mm256_cmpeq_epi8(x, bs);
     // Unsigned x < 0x20: flip the sign bit, then signed compare vs 0xA0.
     __m256i xb = _mm256_xor_si256(x, bias);
-    __m256i m3 = _mm256_cmpgt_epi8(_mm256_set1_epi8((char)0xA0), xb);
+    __m256i m3 = _mm256_cmpgt_epi8(lt20, xb);
     // WTF-8 surrogate lead: byte 0xED followed by 0xA0..0xBF.
     __m256i m4 = _mm256_cmpeq_epi8(x, hiED);
     uint32_t mask = (uint32_t)_mm256_movemask_epi8(_mm256_or_si256(
         _mm256_or_si256(m1, m2), _mm256_or_si256(m3, m4)));
     if (!mask) {
-      out.append((const char*)p + i, 32);
+      std::memcpy(w, p + i, 32);
+      w += 32;
       i += 32;
       continue;
     }
-    // Mask-driven: memcpy the clean runs, escape only the flagged bytes.
-    // (The old code fell back to a byte-by-byte loop for the whole chunk
-    // whenever it held any '"' — and HTML is full of '"' — so the SIMD
-    // never actually sped anything up.)
     size_t pos = i;  // next byte to copy from
     uint32_t m = mask;
     while (m) {
       unsigned b = (unsigned)__builtin_ctz(m);
       size_t j = i + b;
-      if (j > pos) out.append((const char*)p + pos, j - pos);
+      if (j > pos) {
+        std::memcpy(w, p + pos, j - pos);
+        w += j - pos;
+      }
       uint8_t c = p[j];
       if (c == '"' || c == '\\') {
-        out.push('\\');
-        out.push((char)c);
+        *w++ = '\\';
+        *w++ = (char)c;
         pos = j + 1;
       } else if (c < 0x20) {
-        char tmp[8];
-        int mm = std::snprintf(tmp, sizeof tmp, "\\u%04x", c);
-        out.append(tmp, (size_t)mm);
+        if (c == 8 || c == 9 || c == 10 || c == 12 || c == 13) {
+          *w++ = '\\';
+          *w++ = c == 8 ? 'b' : c == 9 ? 't' : c == 10 ? 'n' : c == 12 ? 'f' : 'r';
+        } else {
+          std::memcpy(w, kCtrlU[c], 6);
+          w += 6;
+        }
         pos = j + 1;
       } else if (c == 0xED && j + 2 < n && (p[j + 1] & 0xF0) == 0xA0 &&
                  (p[j + 2] & 0xC0) == 0x80) {
         uint32_t cp = ((c & 0x0F) << 12) | ((p[j + 1] & 0x3F) << 6) | (p[j + 2] & 0x3F);
+        // \uXXXX for the surrogate code unit (table by high nibble is
+        // overkill here — surrogates are vanishingly rare; format inline).
         char tmp[8];
-        int mm = std::snprintf(tmp, sizeof tmp, "\\u%04x", cp);
-        out.append(tmp, (size_t)mm);
+        tmp[0] = '\\';
+        tmp[1] = 'u';
+        tmp[2] = "0123456789abcdef"[(cp >> 12) & 0xF];
+        tmp[3] = "0123456789abcdef"[(cp >> 8) & 0xF];
+        tmp[4] = "0123456789abcdef"[(cp >> 4) & 0xF];
+        tmp[5] = "0123456789abcdef"[cp & 0xF];
+        std::memcpy(w, tmp, 6);
+        w += 6;
         pos = j + 3;
       } else {
-        out.push((char)c);
+        *w++ = (char)c;
         pos = j + 1;
       }
       m &= m - 1;  // clear the lowest set bit (continuation bytes of a
                    // 0xED sequence can never be escape bytes, so no
                    // further mask fix-up is needed)
     }
-    if (pos < i + 32) out.append((const char*)p + pos, i + 32 - pos);
+    if (pos < i + 32) {
+      std::memcpy(w, p + pos, i + 32 - pos);
+      w += i + 32 - pos;
+    }
     i += 32;
   }
-  // Scalar tail.
+  flushLen();
+  // Scalar tail (uses Buf appends; the tail is < 32 bytes).
   for (; i < n; i++) {
     uint8_t c = p[i];
     if (c == '"' || c == '\\') {
       out.push('\\');
       out.push((char)c);
     } else if (c < 0x20) {
-      char tmp[8];
-      int m = std::snprintf(tmp, sizeof tmp, "\\u%04x", c);
-      out.append(tmp, (size_t)m);
+      if (c == 8 || c == 9 || c == 10 || c == 12 || c == 13) {
+        out.push('\\');
+        out.push(c == 8 ? 'b' : c == 9 ? 't' : c == 10 ? 'n' : c == 12 ? 'f' : 'r');
+      } else {
+        out.append(kCtrlU[c], 6);
+      }
     } else if (c == 0xED && i + 2 < n && (p[i + 1] & 0xF0) == 0xA0 &&
                (p[i + 2] & 0xC0) == 0x80) {
       uint32_t cp = ((c & 0x0F) << 12) | ((p[i + 1] & 0x3F) << 6) | (p[i + 2] & 0x3F);
       char tmp[8];
-      int m = std::snprintf(tmp, sizeof tmp, "\\u%04x", cp);
-      out.append(tmp, (size_t)m);
+      tmp[0] = '\\';
+      tmp[1] = 'u';
+      tmp[2] = "0123456789abcdef"[(cp >> 12) & 0xF];
+      tmp[3] = "0123456789abcdef"[(cp >> 8) & 0xF];
+      tmp[4] = "0123456789abcdef"[(cp >> 4) & 0xF];
+      tmp[5] = "0123456789abcdef"[cp & 0xF];
+      out.append(tmp, 6);
       i += 2;
     } else {
       out.push((char)c);
@@ -1049,6 +1090,13 @@ __attribute__((target("avx2"))) static void appendJsonEscapedAVX2(Buf& out, Str 
   }
 }
 static void appendJsonEscapedScalar(Buf& out, Str s) {
+  static const char kCtrlU[32][7] = {
+      "\\u0000", "\\u0001", "\\u0002", "\\u0003", "\\u0004", "\\u0005",
+      "\\u0006", "\\u0007", "\\u0008", "\\u0009", "\\u000a", "\\u000b",
+      "\\u000c", "\\u000d", "\\u000e", "\\u000f", "\\u0010", "\\u0011",
+      "\\u0012", "\\u0013", "\\u0014", "\\u0015", "\\u0016", "\\u0017",
+      "\\u0018", "\\u0019", "\\u001a", "\\u001b", "\\u001c", "\\u001d",
+      "\\u001e", "\\u001f"};
   const uint8_t* p = (const uint8_t*)s.p;
   size_t n = s.n;
   for (size_t i = 0; i < n; i++) {
@@ -1057,15 +1105,23 @@ static void appendJsonEscapedScalar(Buf& out, Str s) {
       out.push('\\');
       out.push((char)c);
     } else if (c < 0x20) {
-      char tmp[8];
-      int m = std::snprintf(tmp, sizeof tmp, "\\u%04x", c);
-      out.append(tmp, (size_t)m);
+      if (c == 8 || c == 9 || c == 10 || c == 12 || c == 13) {
+        out.push('\\');
+        out.push(c == 8 ? 'b' : c == 9 ? 't' : c == 10 ? 'n' : c == 12 ? 'f' : 'r');
+      } else {
+        out.append(kCtrlU[c], 6);
+      }
     } else if (c == 0xED && i + 2 < n && (p[i + 1] & 0xF0) == 0xA0 &&
                (p[i + 2] & 0xC0) == 0x80) {
       uint32_t cp = ((c & 0x0F) << 12) | ((p[i + 1] & 0x3F) << 6) | (p[i + 2] & 0x3F);
       char tmp[8];
-      int m = std::snprintf(tmp, sizeof tmp, "\\u%04x", cp);
-      out.append(tmp, (size_t)m);
+      tmp[0] = '\\';
+      tmp[1] = 'u';
+      tmp[2] = "0123456789abcdef"[(cp >> 12) & 0xF];
+      tmp[3] = "0123456789abcdef"[(cp >> 8) & 0xF];
+      tmp[4] = "0123456789abcdef"[(cp >> 4) & 0xF];
+      tmp[5] = "0123456789abcdef"[cp & 0xF];
+      out.append(tmp, 6);
       i += 2;
     } else {
       out.push((char)c);
@@ -3038,9 +3094,46 @@ struct CaseOut {
   }
 };
 
+// Output emitter: collect mode (runOne, stores into a CaseOut) or stream
+// mode (runAll, appends "path":"text" pairs straight into the answers
+// buffer, JSON-escaped on the fly — no second serialization pass, no
+// intermediate tree walk). Emission order is the same as the CaseOut
+// order, so the streamed answers.json is byte-identical to v2's.
+struct Emitter {
+  CaseOut* collect = nullptr;
+  Buf* out = nullptr;
+  bool first = true;
+  Str* paths = nullptr;  // stream mode: emitted paths (for has())
+  uint32_t npaths = 0, cappaths = 0;
+  void add(Arena* ar, Str path, Str text) {
+    if (collect) {
+      collect->add(ar, path, text);
+      return;
+    }
+    if (npaths == cappaths) {
+      cappaths = cappaths ? cappaths * 2 : 64;
+      Str* ni = ar->allocArr<Str>(cappaths);
+      if (paths) std::memcpy(ni, paths, sizeof(Str) * npaths);
+      paths = ni;
+    }
+    paths[npaths++] = path;
+    if (!first) out->push(',');
+    first = false;
+    appendJsonString(*out, path);
+    out->push(':');
+    appendJsonString(*out, text);
+  }
+  bool has(Str path) const {
+    if (collect) return collect->has(path);
+    for (uint32_t i = 0; i < npaths; i++)
+      if (strEq(paths[i], path)) return true;
+    return false;
+  }
+};
+
 // Run one case. Returns false on a structural problem (never for valid
 // input). The output is appended to `out`.
-static bool runCase(Arena* ar, const Val& input, CaseOut& out) {
+static bool runCase(Arena* ar, const Val& input, Emitter& out) {
   const Val* siteV = input.find("site");
   const Val* templatesV = input.find("templates");
   const Val* filesV = input.find("files");
@@ -3581,7 +3674,10 @@ static bool runCase(Arena* ar, const Val& input, CaseOut& out) {
     nframes++;
     renderOut.reset();
     execTemplate(tpls, ti, frames, nframes, renderOut);
-    htmlOut = ar->dup(renderOut.view());
+    // Stream mode consumes the HTML immediately (emitter escapes it on
+    // the spot), so skip the arena copy; collect mode (runOne) still
+    // needs the dup because the string outlives this call.
+    htmlOut = out.collect ? ar->dup(renderOut.view()) : renderOut.view();
     return true;
   };
 
@@ -3815,32 +3911,22 @@ static napi_value RunOne(napi_env env, napi_callback_info info) {
   Arena ar;
   ar.init(64u << 20);
   Val input = valueFromJs(env, argv[0], &ar);
-  CaseOut out;
-  if (!runCase(&ar, input, out)) {
+  CaseOut co;
+  Emitter em;
+  em.collect = &co;
+  if (!runCase(&ar, input, em)) {
     napiThrow(env, "runCase failed (malformed input)");
     return nullptr;
   }
   napi_value result;
   napi_create_object(env, &result);
-  for (uint32_t i = 0; i < out.n; i++) {
+  for (uint32_t i = 0; i < co.n; i++) {
     napi_value ks, vs;
-    napi_create_string_utf8(env, out.items[i].path.p, out.items[i].path.n, &ks);
-    napi_create_string_utf8(env, out.items[i].text.p, out.items[i].text.n, &vs);
+    napi_create_string_utf8(env, co.items[i].path.p, co.items[i].path.n, &ks);
+    napi_create_string_utf8(env, co.items[i].text.p, co.items[i].text.n, &vs);
     napi_set_property(env, result, ks, vs);
   }
   return result;
-}
-
-// Serialize one case output into the answers buffer.
-static void appendCaseJson(Buf& out, const CaseOut& co) {
-  out.push('{');
-  for (uint32_t i = 0; i < co.n; i++) {
-    if (i) out.push(',');
-    appendJsonString(out, co.items[i].path);
-    out.push(':');
-    appendJsonString(out, co.items[i].text);
-  }
-  out.push('}');
 }
 
 // runAll([inputDir, outputDir]): the driver path. Reads cases.json,
@@ -3925,20 +4011,19 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
         return nullptr;
       }
       buildAr.reset();
-      CaseOut out;
+      if (ci) answers.push(',');
+      answers.push('{');
+      Emitter em;
+      em.out = &answers;
       {
         ProfTimer _pt2("runCase");
-        if (!runCase(&buildAr, *input, out)) {
+        if (!runCase(&buildAr, *input, em)) {
           std::free(buf);
           napiThrow(env, "runCase failed");
           return nullptr;
         }
       }
-      if (ci) answers.push(',');
-      {
-        ProfTimer _pt3("json_write");
-        appendCaseJson(answers, out);
-      }
+      answers.push('}');
     }
     answers.push(']');
     FILE* of = std::fopen(outPath.c_str(), "wb");
