@@ -3820,22 +3820,25 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2];
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  // Args (as main.ts passes them) are FILE paths: cases.json in,
+  // answers.json out. With no args, fall back to the env dirs.
   std::string inputDir = "/input", outputDir = "/output";
   if (const char* e = std::getenv("MAKEFUN_INPUT_DIR")) inputDir = e;
   if (const char* e = std::getenv("MAKEFUN_OUTPUT_DIR")) outputDir = e;
+  std::string casesPath = inputDir + "/cases.json";
+  std::string outPath = outputDir + "/answers.json";
   if (argc >= 1) {
     char buf[1024];
     size_t len = 0;
     if (napi_get_value_string_utf8(env, argv[0], buf, sizeof buf, &len) == napi_ok && len > 0)
-      inputDir.assign(buf, len);
+      casesPath.assign(buf, len);
   }
   if (argc >= 2) {
     char buf[1024];
     size_t len = 0;
     if (napi_get_value_string_utf8(env, argv[1], buf, sizeof buf, &len) == napi_ok && len > 0)
-      outputDir.assign(buf, len);
+      outPath.assign(buf, len);
   }
-  std::string casesPath = inputDir + "/cases.json";
   FILE* f = std::fopen(casesPath.c_str(), "rb");
   if (!f) {
     napiThrow(env, ("cannot open " + casesPath).c_str());
@@ -3890,7 +3893,6 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
       appendCaseJson(answers, out);
     }
     answers.push(']');
-    std::string outPath = outputDir + "/answers.json";
     FILE* of = std::fopen(outPath.c_str(), "wb");
     if (!of) {
       std::free(buf);
