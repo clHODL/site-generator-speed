@@ -454,6 +454,79 @@ static inline size_t findInSet(const uint8_t* p, size_t n, const uint8_t* member
   return findInSetScalar(p, n, members, nmem);
 }
 
+// ---- shuffle-based set scan (Stage 3) ----
+// A 16-entry nibble table pair (low/high) encodes up to 8 members as a
+// per-member bitmask: lowTable[byte & 0xF] has member M's bit iff M's low
+// nibble matches, highTable[byte >> 4] has M's bit iff M's high nibble
+// matches. The AND is nonzero iff the byte equals a member (the same
+// member's bit must be set in BOTH tables, which requires both nibbles
+// to match — no false positives). 8 members fit in one byte; a 9th
+// member is handled by one direct compare. ~7 SIMD ops per 32 bytes
+// vs ~2 per member for the compare loop (18 for 9 members).
+static const uint8_t kInlineLow32[32] = {
+  0x02, 0x00, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00,
+  0x00, 0x00, 0x04, 0x08, 0x21, 0x00, 0x40, 0x00,
+  0x02, 0x00, 0x80, 0x00, 0x00, 0x00, 0x10, 0x00,
+  0x00, 0x00, 0x04, 0x08, 0x21, 0x00, 0x40, 0x00};
+static const uint8_t kInlineHigh32[32] = {
+  0x00, 0x00, 0x94, 0x60, 0x00, 0x09, 0x02, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x94, 0x60, 0x00, 0x09, 0x02, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t kHtmlEscLow32[32] = {
+  0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x10,
+  0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x04, 0x00,
+  0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x10,
+  0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x04, 0x00};
+static const uint8_t kHtmlEscHigh32[32] = {
+  0x00, 0x00, 0x19, 0x06, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x19, 0x06, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+__attribute__((target("avx2"))) static size_t findInSetShuffleAVX2(
+    const uint8_t* p, size_t n, const uint8_t* low32, const uint8_t* high32,
+    int extra) {
+  const __m256i lowTab = _mm256_loadu_si256((const __m256i*)low32);
+  const __m256i highTab = _mm256_loadu_si256((const __m256i*)high32);
+  const __m256i mask0F = _mm256_set1_epi8(0x0F);
+  const __m256i extraVec = _mm256_set1_epi8((char)extra);
+  const bool hasExtra = extra >= 0;
+  size_t i = 0;
+  size_t lim = n & ~(size_t)31;
+  for (; i < lim; i += 32) {
+    __m256i x = _mm256_loadu_si256((const __m256i*)(p + i));
+    __m256i low = _mm256_and_si256(x, mask0F);
+    __m256i high = _mm256_and_si256(_mm256_srli_epi16(x, 4), mask0F);
+    __m256i m = _mm256_and_si256(_mm256_shuffle_epi8(lowTab, low),
+                                  _mm256_shuffle_epi8(highTab, high));
+    if (hasExtra) m = _mm256_or_si256(m, _mm256_cmpeq_epi8(x, extraVec));
+    // m is a per-member bitmask (0x01..0x80), NOT an MSB mask — movemask
+    // reads bit 7 only, so compare against zero and invert instead.
+    uint32_t mask = (uint32_t)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(m, _mm256_setzero_si256()));
+    mask = ~mask;
+    if (mask) return i + (size_t)__builtin_ctz(mask);
+  }
+  for (; i < n; i++) {
+    uint8_t c = p[i];
+    if ((low32[c & 0x0F] & high32[c >> 4]) != 0) return i;
+    if (hasExtra && c == (uint8_t)extra) return i;
+  }
+  return n;
+}
+// Inline special chars: \ ` * [ & < > " ' (9 members; ' via compare).
+static const uint8_t kInlineMembers9[9] = {'\\', '`', '*', '[', '&', '<', '>', '"', '\''};
+static inline size_t findInline(const uint8_t* p, size_t n) {
+  if (cpuHasAVX2()) return findInSetShuffleAVX2(p, n, kInlineLow32, kInlineHigh32, '\'');
+  return findInSetScalar(p, n, kInlineMembers9, 9);
+}
+// HTML-escape set: & < > " ' (5 members, all in the shuffle).
+static const uint8_t kHtmlEscMembers5[5] = {'&', '<', '>', '"', '\''};
+static inline size_t findHtmlEsc(const uint8_t* p, size_t n) {
+  if (cpuHasAVX2()) return findInSetShuffleAVX2(p, n, kHtmlEscLow32, kHtmlEscHigh32, -1);
+  return findInSetScalar(p, n, kHtmlEscMembers5, 5);
+}
+
 // Find the next '\n' at or after i (or n). AVX2 memchr-style scan.
 __attribute__((target("avx2"))) static size_t findNewlineAVX2(const uint8_t* p, size_t n,
                                                               size_t i) {
@@ -1273,13 +1346,12 @@ static Str longDate(Arena* ar, Str date) {
 
 static inline void appendEscaped(Buf& out, Str s) {
   // HTML-escape & < > " ' (escapeHtml). Fast path: scan for the set with
-  // the SIMD set scanner; clean runs memcpy whole.
-  static const uint8_t members[5] = {'&', '<', '>', '"', '\''};
+  // the shuffle scanner; clean runs memcpy whole.
   const uint8_t* p = (const uint8_t*)s.p;
   size_t n = s.n;
   size_t i = 0;
   while (i < n) {
-    size_t rel = findInSet(p + i, n - i, members, 5);
+    size_t rel = findHtmlEsc(p + i, n - i);
     size_t j = i + rel;
     if (rel) out.append((const char*)p + i, rel);
     if (j >= n) break;
@@ -1622,6 +1694,748 @@ static FmResult parseFrontMatter(Arena* ar, Str content) {
   return r;
 }
 
+// ---------------------------------------------------------------- flat structs (v6)
+// Streaming-parse targets: no Val tree, no find() scans. Strings are
+// views into the input buffer (or arena dups when unescaped).
+
+struct Heading;  // defined in the Markdown section below
+
+struct Fm {
+  Str title;
+  Str date; bool hasDate = false;
+  Str* tags = nullptr; uint32_t ntags = 0;
+  bool draft = false;
+  Str layout; bool hasLayout = false;
+  Str slug; bool hasSlug = false;
+  Str summary; bool hasSummary = false;
+};
+struct TagLinkF {
+  Str name, slug, url;
+  int64_t count = 0;
+  bool hasCount = false;
+};
+struct LinkF { Str title, url, date, date_long; };
+struct CardF {
+  Str title, url, date, date_long, summary, excerpt;
+  int64_t reading_minutes = 1;
+  TagLinkF* tags = nullptr;
+  uint32_t ntags = 0;
+};
+struct SourceF {
+  Str path, text, body;
+  Fm fm;
+  bool post = false;
+  Str layout, slug, outDir, url;
+  Str html, excerpt;
+  Heading* toc = nullptr; uint32_t ntoc = 0;
+  TagLinkF* tagLinks = nullptr;
+  uint32_t ntagLinks = 0;
+  int32_t newer = -1, older = -1;
+  CardF card;
+  LinkF newerL, olderL;  // neighbour links (for PageF)
+};
+struct TagObjF {
+  Str name, slug, url;
+  uint32_t* posts = nullptr;  // source indices
+  uint32_t nposts = 0, capPosts = 0;
+  TagLinkF link;  // memoized {name, slug, url}
+  bool hasLink = false;
+};
+struct TplSrc { Str name, src; };
+struct FileSrc { Str path, content; };
+struct CaseF {
+  Str siteTitle, base;
+  bool hasSite = false, hasTemplates = false, hasFiles = false, hasInput = false;
+  bool hasPer = false; double perNum = 0;
+  bool hasRecent = false; double recentNum = 0;
+  TplSrc* tpls = nullptr; uint32_t ntpls = 0;
+  FileSrc* files = nullptr; uint32_t nfiles = 0;
+};
+
+// ---------------------------------------------------------------- streaming JSON parser (v6)
+// Parses cases.json directly into flat CaseF structs — no Val tree, no
+// find() scans. string()/number() are the JsonParser's proven logic,
+// adapted to return Str / Num instead of Val.
+
+struct FlatParser {
+  const uint8_t* p;
+  const uint8_t* e;
+  Arena* ar;
+  bool ok = true;
+  FlatParser(const uint8_t* b, const uint8_t* en, Arena* a) : p(b), e(en), ar(a) {}
+  void ws() {
+    while (p < e && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+  }
+  bool consume(char c) {
+    ws();
+    if (p < e && *p == (uint8_t)c) { p++; return true; }
+    ok = false;
+    return false;
+  }
+  bool consumeLit(const char* lit, size_t n) {
+    if ((size_t)(e - p) < n || std::memcmp(p, lit, n) != 0) { ok = false; return false; }
+    p += n;
+    return true;
+  }
+  struct Num { bool isDbl = false; int64_t i = 0; double d = 0; };
+  Str string() {
+    const uint8_t* start = p + 1;
+    static const uint8_t members[2] = {'"', '\\'};
+    size_t rem = (size_t)(e - start);
+    size_t rel = findInSet(start, rem, members, 2);
+    if (rel < rem && start[rel] == '"') {
+      Str r((const char*)start, (uint32_t)rel);
+      p = start + rel + 1;
+      return r;
+    }
+    Buf tmp;
+    const uint8_t* q = start;
+    while (q < e) {
+      size_t rem2 = (size_t)(e - q);
+      size_t rel2 = findInSet(q, rem2, members, 2);
+      if (rel2 < rem2 && q[rel2] == '"') {
+        tmp.append((const char*)q, rel2);
+        p = q + rel2 + 1;
+        Str r = ar->dup(tmp.view());
+        return r;
+      }
+      tmp.append((const char*)q, rel2);
+      q += rel2;
+      if (q >= e) break;
+      q++;
+      if (q >= e) break;
+      uint8_t esc = *q++;
+      switch (esc) {
+        case '"': tmp.push('"'); break;
+        case '\\': tmp.push('\\'); break;
+        case '/': tmp.push('/'); break;
+        case 'b': tmp.push('\b'); break;
+        case 'f': tmp.push('\f'); break;
+        case 'n': tmp.push('\n'); break;
+        case 'r': tmp.push('\r'); break;
+        case 't': tmp.push('\t'); break;
+        case 'u': {
+          auto hex4 = [&]() -> int {
+            if (e - q < 4) return -1;
+            int v = 0;
+            for (int k = 0; k < 4; k++) {
+              uint8_t h = q[k];
+              int d;
+              if (h >= '0' && h <= '9') d = h - '0';
+              else if (h >= 'a' && h <= 'f') d = h - 'a' + 10;
+              else if (h >= 'A' && h <= 'F') d = h - 'A' + 10;
+              else return -1;
+              v = (v << 4) | d;
+            }
+            q += 4;
+            return v;
+          };
+          int cp = hex4();
+          if (cp < 0) { ok = false; return Str(); }
+          if (cp >= 0xD800 && cp < 0xDC00) {
+            const uint8_t* save = q;
+            if (e - q >= 6 && q[0] == '\\' && q[1] == 'u') {
+              q += 2;
+              int lo2 = hex4();
+              if (lo2 >= 0xDC00 && lo2 < 0xE000) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo2 - 0xDC00);
+              } else {
+                q = save;
+              }
+            }
+          }
+          char enc[4];
+          size_t en = 0;
+          utf8Encode(enc, (uint32_t)cp, en);
+          tmp.append(enc, en);
+          break;
+        }
+        default:
+          ok = false;
+          return Str();
+      }
+    }
+    ok = false;
+    return Str();
+  }
+  Num number() {
+    const uint8_t* s = p;
+    if (p < e && *p == '-') p++;
+    bool isInt = true;
+    while (p < e && *p >= '0' && *p <= '9') p++;
+    if (p < e && *p == '.') {
+      isInt = false;
+      p++;
+      while (p < e && *p >= '0' && *p <= '9') p++;
+    }
+    if (p < e && (*p == 'e' || *p == 'E')) {
+      isInt = false;
+      p++;
+      if (p < e && (*p == '+' || *p == '-')) p++;
+      while (p < e && *p >= '0' && *p <= '9') p++;
+    }
+    size_t n = (size_t)(p - s);
+    if (n == 0) { ok = false; return Num(); }
+    if (isInt) {
+      bool neg = s[0] == '-';
+      const uint8_t* d0 = s + (neg ? 1 : 0);
+      uint64_t mag = 0;
+      bool over = false;
+      for (const uint8_t* q = d0; q < p; q++) {
+        if (mag > (UINT64_MAX - 9) / 10) over = true;
+        else mag = mag * 10 + (uint64_t)(*q - '0');
+      }
+      if (!over) {
+        int64_t v = 0;
+        if (neg) {
+          if (mag > (uint64_t)INT64_MAX + 1) over = true;
+          else v = mag == (uint64_t)INT64_MAX + 1 ? INT64_MIN : -(int64_t)mag;
+        } else {
+          if (mag > (uint64_t)INT64_MAX) over = true;
+          else v = (int64_t)mag;
+        }
+        if (!over) { Num r; r.isDbl = false; r.i = v; return r; }
+      }
+    }
+    char buf[64];
+    size_t cn = n < sizeof buf - 1 ? n : sizeof buf - 1;
+    std::memcpy(buf, s, cn);
+    buf[cn] = 0;
+    Num r;
+    r.isDbl = true;
+    r.d = std::strtod(buf, nullptr);
+    return r;
+  }
+  void skipValue() {
+    ws();
+    if (p >= e) { ok = false; return; }
+    uint8_t c = *p;
+    if (c == '"') { string(); return; }
+    if (c == '{') {
+      p++;
+      ws();
+      if (p < e && *p == '}') { p++; return; }
+      while (true) {
+        ws();
+        string();
+        if (!ok) return;
+        ws();
+        if (!consume(':')) return;
+        skipValue();
+        if (!ok) return;
+        ws();
+        if (p < e && *p == ',') { p++; continue; }
+        if (p < e && *p == '}') { p++; break; }
+        ok = false;
+        return;
+      }
+      return;
+    }
+    if (c == '[') {
+      p++;
+      ws();
+      if (p < e && *p == ']') { p++; return; }
+      while (true) {
+        skipValue();
+        if (!ok) return;
+        ws();
+        if (p < e && *p == ',') { p++; continue; }
+        if (p < e && *p == ']') { p++; break; }
+        ok = false;
+        return;
+      }
+      return;
+    }
+    if (c == 't') { consumeLit("true", 4); return; }
+    if (c == 'f') { consumeLit("false", 5); return; }
+    if (c == 'n') { consumeLit("null", 4); return; }
+    number();
+  }
+  bool parseSite(CaseF& c) {
+    ws();
+    if (!consume('{')) return false;
+    ws();
+    if (p < e && *p == '}') { p++; return true; }
+    while (true) {
+      ws();
+      Str key = string();
+      if (!ok) return false;
+      ws();
+      if (!consume(':')) return false;
+      if (strEq(key, S("title")) || strEq(key, S("base_url"))) {
+        ws();
+        if (p < e && *p == '"') {
+          Str v = string();
+          if (strEq(key, S("title"))) c.siteTitle = v; else c.base = v;
+        } else {
+          skipValue();
+        }
+      } else if (strEq(key, S("per_page")) || strEq(key, S("recent"))) {
+        ws();
+        if (p < e && ((*p >= '0' && *p <= '9') || *p == '-')) {
+          Num nm = number();
+          double dv = nm.isDbl ? nm.d : (double)nm.i;
+          if (strEq(key, S("per_page"))) { c.hasPer = true; c.perNum = dv; }
+          else { c.hasRecent = true; c.recentNum = dv; }
+        } else {
+          skipValue();
+        }
+      } else {
+        skipValue();
+      }
+      if (!ok) return false;
+      ws();
+      if (p < e && *p == ',') { p++; continue; }
+      if (p < e && *p == '}') { p++; break; }
+      ok = false;
+      return false;
+    }
+    return true;
+  }
+  bool parseTemplates(CaseF& c) {
+    ws();
+    if (!consume('{')) return false;
+    ws();
+    if (p < e && *p == '}') { p++; return true; }
+    TplSrc* arr = nullptr;
+    uint32_t n = 0, cap = 0;
+    while (true) {
+      ws();
+      Str key = string();
+      if (!ok) return false;
+      ws();
+      if (!consume(':')) return false;
+      ws();
+      Str v;
+      if (p < e && *p == '"') v = string();
+      else { skipValue(); v = Str(); }
+      if (!ok) return false;
+      if (n == cap) {
+        cap = cap ? cap * 2 : 8;
+        TplSrc* ni = ar->allocArr<TplSrc>(cap);
+        if (arr) std::memcpy(ni, arr, sizeof(TplSrc) * n);
+        arr = ni;
+      }
+      arr[n++] = TplSrc{key, v};
+      ws();
+      if (p < e && *p == ',') { p++; continue; }
+      if (p < e && *p == '}') { p++; break; }
+      ok = false;
+      return false;
+    }
+    c.tpls = arr;
+    c.ntpls = n;
+    return true;
+  }
+  bool parseFiles(CaseF& c) {
+    ws();
+    if (!consume('[')) return false;
+    ws();
+    if (p < e && *p == ']') { p++; return true; }
+    FileSrc* arr = nullptr;
+    uint32_t n = 0, cap = 0;
+    while (true) {
+      ws();
+      Str pa, co;
+      bool hasP = false, hasC = false;
+      if (!consume('{')) return false;
+      ws();
+      if (p < e && *p == '}') {
+        p++;
+      } else {
+        while (true) {
+          ws();
+          Str key = string();
+          if (!ok) return false;
+          ws();
+          if (!consume(':')) return false;
+          if (strEq(key, S("path")) || strEq(key, S("content"))) {
+            ws();
+            if (p < e && *p == '"') {
+              Str v = string();
+              if (strEq(key, S("path"))) { pa = v; hasP = true; }
+              else { co = v; hasC = true; }
+            } else {
+              skipValue();
+            }
+          } else {
+            skipValue();
+          }
+          if (!ok) return false;
+          ws();
+          if (p < e && *p == ',') { p++; continue; }
+          if (p < e && *p == '}') { p++; break; }
+          ok = false;
+          return false;
+        }
+      }
+      if (hasP && hasC) {
+        if (n == cap) {
+          cap = cap ? cap * 2 : 16;
+          FileSrc* ni = ar->allocArr<FileSrc>(cap);
+          if (arr) std::memcpy(ni, arr, sizeof(FileSrc) * n);
+          arr = ni;
+        }
+        arr[n++] = FileSrc{pa, co};
+      }
+      ws();
+      if (p < e && *p == ',') { p++; continue; }
+      if (p < e && *p == ']') { p++; break; }
+      ok = false;
+      return false;
+    }
+    c.files = arr;
+    c.nfiles = n;
+    return true;
+  }
+  bool parseInput(CaseF& c) {
+    ws();
+    if (!consume('{')) return false;
+    ws();
+    if (p < e && *p == '}') { p++; return true; }
+    while (true) {
+      ws();
+      Str key = string();
+      if (!ok) return false;
+      ws();
+      if (!consume(':')) return false;
+      if (strEq(key, S("site"))) {
+        c.hasSite = true;
+        if (!parseSite(c)) return false;
+      } else if (strEq(key, S("templates"))) {
+        c.hasTemplates = true;
+        if (!parseTemplates(c)) return false;
+      } else if (strEq(key, S("files"))) {
+        c.hasFiles = true;
+        if (!parseFiles(c)) return false;
+      } else {
+        skipValue();
+      }
+      if (!ok) return false;
+      ws();
+      if (p < e && *p == ',') { p++; continue; }
+      if (p < e && *p == '}') { p++; break; }
+      ok = false;
+      return false;
+    }
+    return true;
+  }
+  bool parseCase(CaseF& c) {
+    ws();
+    if (!consume('{')) return false;
+    ws();
+    if (p < e && *p == '}') { p++; return true; }
+    while (true) {
+      ws();
+      Str key = string();
+      if (!ok) return false;
+      ws();
+      if (!consume(':')) return false;
+      if (strEq(key, S("input"))) {
+        c.hasInput = true;
+        if (!parseInput(c)) return false;
+      } else {
+        skipValue();
+      }
+      if (!ok) return false;
+      ws();
+      if (p < e && *p == ',') { p++; continue; }
+      if (p < e && *p == '}') { p++; break; }
+      ok = false;
+      return false;
+    }
+    return true;
+  }
+  CaseF* parseCases(uint32_t& nout) {
+    nout = 0;
+    ws();
+    if (!consume('[')) return nullptr;
+    CaseF* cases = nullptr;
+    uint32_t n = 0, cap = 0;
+    ws();
+    if (p < e && *p == ']') { p++; nout = 0; return cases; }
+    while (true) {
+      ws();
+      CaseF c;
+      c = CaseF();
+      if (!parseCase(c)) return nullptr;
+      if (n == cap) {
+        cap = cap ? cap * 2 : 4;
+        CaseF* ni = ar->allocArr<CaseF>(cap);
+        if (cases) std::memcpy(ni, cases, sizeof(CaseF) * n);
+        cases = ni;
+      }
+      cases[n++] = c;
+      ws();
+      if (p < e && *p == ',') { p++; continue; }
+      if (p < e && *p == ']') { p++; break; }
+      ok = false;
+      return nullptr;
+    }
+    nout = n;
+    return cases;
+  }
+};
+
+// Val input (runOne) -> flat CaseF. Only used by the dev-harness path.
+static CaseF caseFromVal(Arena* ar, const Val& input) {
+  CaseF c;
+  c = CaseF();
+  c.hasInput = true;
+  const Val* siteV = input.find("site");
+  if (siteV && siteV->type == Val::Obj) {
+    c.hasSite = true;
+    const Val* t = siteV->find("title");
+    if (t && t->type == Val::Str) c.siteTitle = t->s;
+    const Val* b = siteV->find("base_url");
+    if (b && b->type == Val::Str) c.base = b->s;
+    const Val* pp = siteV->find("per_page");
+    if (pp && pp->isNum()) { c.hasPer = true; c.perNum = pp->asNum(); }
+    const Val* rc = siteV->find("recent");
+    if (rc && rc->isNum()) { c.hasRecent = true; c.recentNum = rc->asNum(); }
+  }
+  const Val* tplV = input.find("templates");
+  if (tplV && tplV->type == Val::Obj) {
+    c.hasTemplates = true;
+    c.tpls = ar->allocArr<TplSrc>(tplV->obj.n ? tplV->obj.n : 1);
+    c.ntpls = 0;
+    for (uint32_t i = 0; i < tplV->obj.n; i++) {
+      const Val* sv = &tplV->obj.items[i].val;
+      c.tpls[c.ntpls++] =
+          TplSrc{tplV->obj.items[i].key, (sv && sv->type == Val::Str) ? sv->s : Str()};
+    }
+  }
+  const Val* filesV = input.find("files");
+  if (filesV && filesV->type == Val::Arr) {
+    c.hasFiles = true;
+    c.files = ar->allocArr<FileSrc>(filesV->arr.n ? filesV->arr.n : 1);
+    c.nfiles = 0;
+    for (uint32_t i = 0; i < filesV->arr.n; i++) {
+      const Val* f = &filesV->arr.items[i];
+      const Val* pa = f->find("path");
+      const Val* co = f->find("content");
+      if (!pa || pa->type != Val::Str || !co || co->type != Val::Str) continue;
+      c.files[c.nfiles++] = FileSrc{pa->s, co->s};
+    }
+  }
+  return c;
+}
+
+// ---------------------------------------------------------------- flat front matter (v6)
+// Same logic and error messages as parseFrontMatter, filling an Fm.
+
+struct FmResultF {
+  Str body;
+  Fm fm;
+  bool err = false;
+  Str errMsg;
+};
+
+static bool valueOfKeyFlat(Arena* ar, Str key, Str raw, Fm& fm, Str& errMsg, Buf& scratch) {
+  if (strEq(key, S("title")) || strEq(key, S("summary"))) {
+    Str v, em;
+    if (!stringOfValue(raw, v, em, scratch)) {
+      errMsg = ar->cat({S("key \""), key, S("\": "), em});
+      return false;
+    }
+    Str dv = ar->dup(v);
+    if (strEq(key, S("title"))) fm.title = dv;
+    else { fm.summary = dv; fm.hasSummary = true; }
+    return true;
+  }
+  if (strEq(key, S("date"))) {
+    if (!isValidDate(raw)) {
+      errMsg = S("key \"date\": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)");
+      return false;
+    }
+    fm.date = raw;
+    fm.hasDate = true;
+    return true;
+  }
+  if (strEq(key, S("tags"))) {
+    if (raw.n < 2 || raw.p[0] != '[' || raw.p[raw.n - 1] != ']') {
+      errMsg = S("key \"tags\": not a list [a, b]");
+      return false;
+    }
+    Str inner = raw.substr(1, raw.n - 2);
+    if (jsTrim(inner).n == 0) {
+      fm.tags = nullptr;
+      fm.ntags = 0;
+      return true;
+    }
+    Str* tagsArr = nullptr;
+    uint32_t tn = 0, tcap = 0;
+    size_t start = 0;
+    while (true) {
+      size_t comma = start;
+      while (comma < inner.n && inner.p[comma] != ',') comma++;
+      Str part = jsTrim(inner.substr(start, comma - start));
+      bool bad = part.n == 0;
+      if (!bad)
+        for (uint32_t q = 0; q < part.n; q++)
+          if (part.p[q] == '"' || part.p[q] == '[' || part.p[q] == ']') {
+            bad = true;
+            break;
+          }
+      if (bad) {
+        errMsg = S("key \"tags\": an empty tag, or one holding \" [ or ]");
+        return false;
+      }
+      if (tn == tcap) {
+        tcap = tcap ? tcap * 2 : 4;
+        Str* ni = ar->allocArr<Str>(tcap);
+        if (tagsArr) std::memcpy(ni, tagsArr, sizeof(Str) * tn);
+        tagsArr = ni;
+      }
+      tagsArr[tn++] = part;
+      if (comma >= inner.n) break;
+      start = comma + 1;
+    }
+    fm.tags = tagsArr;
+    fm.ntags = tn;
+    return true;
+  }
+  if (strEq(key, S("draft"))) {
+    if (strEq(raw, S("true"))) {
+      fm.draft = true;
+      return true;
+    }
+    if (strEq(raw, S("false"))) {
+      fm.draft = false;
+      return true;
+    }
+    errMsg = S("key \"draft\": true or false");
+    return false;
+  }
+  if (strEq(key, S("layout"))) {
+    bool ok = raw.n > 0;
+    for (uint32_t q = 0; ok && q < raw.n; q++) {
+      char c = raw.p[q];
+      if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) ok = false;
+    }
+    if (!ok) {
+      errMsg = S("key \"layout\": not a template name");
+      return false;
+    }
+    fm.layout = raw;
+    fm.hasLayout = true;
+    return true;
+  }
+  if (strEq(key, S("slug"))) {
+    bool ok = raw.n > 0 && raw.n <= 64;
+    if (ok) {
+      bool lastDash = false;
+      for (uint32_t q = 0; q < raw.n; q++) {
+        char c = raw.p[q];
+        if (c == '-') {
+          if (q == 0 || q == raw.n - 1 || lastDash) {
+            ok = false;
+            break;
+          }
+          lastDash = true;
+        } else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+          lastDash = false;
+        } else {
+          ok = false;
+          break;
+        }
+      }
+    }
+    if (!ok) {
+      errMsg = S("key \"slug\": not a slug");
+      return false;
+    }
+    fm.slug = raw;
+    fm.hasSlug = true;
+    return true;
+  }
+  errMsg = ar->cat({S("unknown key \""), key, S("\"")});
+  return false;
+}
+
+static FmResultF parseFrontMatterFlat(Arena* ar, Str content) {
+  FmResultF r;
+  auto fail = [&](Str msg) {
+    r.err = true;
+    r.errMsg = msg;
+    r.body = Str();
+    r.fm = Fm();
+    return r;
+  };
+  if (content.n < 3 || content.p[0] != '-' || content.p[1] != '-' || content.p[2] != '-')
+    return fail(S("no front matter"));
+  if (content.n > 3 && content.p[3] != '\n') return fail(S("no front matter"));
+  if (content.n == 3) return fail(S("the front matter is not closed"));
+  long closeStart = -1;
+  size_t p = 4;
+  while (p < content.n) {
+    size_t nl = findNewline((const uint8_t*)content.p, content.n, p);
+    size_t lineEnd = nl >= content.n ? content.n : nl;
+    if (lineEnd - p == 3 && content.p[p] == '-' && content.p[p + 1] == '-' &&
+        content.p[p + 2] == '-')
+      closeStart = (long)p;
+    if (closeStart >= 0 || nl >= content.n) break;
+    p = nl + 1;
+  }
+  if (closeStart < 0) return fail(S("the front matter is not closed"));
+  Str fmText = content.substr(4, (size_t)closeStart - 4);
+  uint32_t seen = 0;  // bit per FM key (title=1 date=2 tags=4 draft=8 layout=16 slug=32 summary=64)
+  auto keyBit = [](Str key) -> uint32_t {
+    if (strEq(key, S("title"))) return 1;
+    if (strEq(key, S("date"))) return 2;
+    if (strEq(key, S("tags"))) return 4;
+    if (strEq(key, S("draft"))) return 8;
+    if (strEq(key, S("layout"))) return 16;
+    if (strEq(key, S("slug"))) return 32;
+    if (strEq(key, S("summary"))) return 64;
+    return 0;
+  };
+  Buf scratch;
+  if (fmText.n > 0) {
+    size_t fpos = 0;
+    uint32_t k = 0;
+    while (true) {
+      size_t eol = findNewline((const uint8_t*)fmText.p, fmText.n, fpos);
+      Str line = fmText.substr(fpos, eol - fpos);
+      bool last = eol >= fmText.n;
+      if (!isFmBlank(line) && !(line.n > 0 && line.p[0] == '#')) {
+        Str key, raw;
+        bool hasValue = false;
+        if (!matchLineRe(line, key, raw, hasValue)) {
+          char nb[16];
+          int nn = std::snprintf(nb, sizeof nb, "%u", k + 2);
+          return fail(ar->cat({S("line "), Str(nb, (uint32_t)nn), S(" is not \"key: value\"")}));
+        }
+        if (hasValue) {
+          size_t e = raw.n;
+          while (e > 0 && (raw.p[e - 1] == ' ' || raw.p[e - 1] == '\t')) e--;
+          raw = raw.substr(0, e);
+        } else {
+          raw = Str();
+        }
+        uint32_t bit = keyBit(key);
+        if (!bit) return fail(ar->cat({S("unknown key \""), key, S("\"")}));
+        if (seen & bit)
+          return fail(ar->cat({S("key \""), key, S("\" is given twice")}));
+        seen |= bit;
+        if (raw.n == 0)
+          return fail(ar->cat({S("key \""), key, S("\" has no value")}));
+        Str em;
+        if (!valueOfKeyFlat(ar, key, raw, r.fm, em, scratch)) return fail(em);
+      }
+      if (last) break;
+      fpos = eol + 1;
+      k++;
+    }
+  }
+  if (!(seen & 1)) return fail(S("no title"));
+  size_t bodyStart = (size_t)closeStart + 3;
+  r.body = (bodyStart < content.n && content.p[bodyStart] == '\n')
+               ? content.substr(bodyStart + 1)
+               : content.substr(bodyStart);
+  return r;
+}
+
 // ---------------------------------------------------------------- Markdown
 // Single-pass: one line table per body (SIMD newline scan), blocks walked
 // once, inline rendered by an SIMD special-byte scanner. Mirrors the JS
@@ -1828,7 +2642,6 @@ static void renderInline(Buf& out, Str text, InlineCtx& ctx);
 
 // Inline special-byte set: \ ` * [ & < > " '
 // (backslash, backtick, asterisk, bracket, amp, lt, gt, dquote, squote)
-static const uint8_t kInlineMembers[9] = {'\\', '`', '*', '[', '&', '<', '>', '"', '\''};
 
 // ---- inline helpers (exact ports of the JS reference) ----
 
@@ -1966,7 +2779,7 @@ static void renderInline(Buf& out, Str text, InlineCtx& ctx) {
   size_t n = text.n;
   size_t i = 0;
   while (i < n) {
-    size_t rel = findInSet((const uint8_t*)text.p + i, n - i, kInlineMembers, 9);
+    size_t rel = findInline((const uint8_t*)text.p + i, n - i);
     size_t k = i + rel;
     if (rel) out.append(text.p + i, rel);
     if (k >= n) break;
@@ -2433,27 +3246,37 @@ static MdOut renderMarkdown(Arena* ar, Str body, InlineCtx& ctx) {
       continue;
     }
     // Paragraph: first line + following lines until blank/fence/heading/hr.
-    scratch.reset();
-    scratch.append(trimST(line));
-    i++;
-    while (i < nlines) {
-      LineKind k = kindAt((uint32_t)i);
+    // Render inline directly into html (no intermediate Buf + copy); the
+    // excerpt (first paragraph only) is a dup of the byte range in html.
+    size_t paraStart = i;
+    size_t paraEnd = i + 1;
+    while (paraEnd < nlines) {
+      LineKind k = kindAt((uint32_t)paraEnd);
       if (k == LK_BLANK || k == LK_FENCE || k == LK_HEADING || k == LK_HR) break;
-      scratch.push('\n');
-      scratch.append(trimST(lines[i]));
-      i++;
+      paraEnd++;
     }
-    Buf pb;
-    renderInline(pb, scratch.view(), ctx);
-    if (!hasExcerpt) {
-      excerpt = ar->dup(pb.view());
-      hasExcerpt = true;
-    }
+    bool singleLine = (paraEnd == paraStart + 1);
     if (anyBlock) html.push('\n');
     anyBlock = true;
     html.append("<p>");
-    html.append(pb.view());
+    size_t contentStart = html.len;
+    if (singleLine) {
+      renderInline(html, trimST(line), ctx);
+    } else {
+      scratch.reset();
+      scratch.append(trimST(line));
+      for (size_t q = paraStart + 1; q < paraEnd; q++) {
+        scratch.push('\n');
+        scratch.append(trimST(lines[q]));
+      }
+      renderInline(html, scratch.view(), ctx);
+    }
+    if (!hasExcerpt) {
+      excerpt = ar->dup(Str(html.data + contentStart, (uint32_t)(html.len - contentStart)));
+      hasExcerpt = true;
+    }
     html.append("</p>");
+    i = paraEnd;
   }
   MdOut out;
   if (anyBlock) html.push('\n');
@@ -3363,14 +4186,14 @@ static void execTemplate(Template* tpls, int32_t startIdx, Frame* frames, uint32
         break;
       case Op::Var: {
         const Val* v = resolvePlanned(&op, frames, nframes, &scratch);
-        if (stream) appendTextOfEscapedJson(out, v);
+        if (stream) { ProfTimer _pt("tpl.var"); appendTextOfEscapedJson(out, v); }
         else appendTextOfEscaped(out, v);
         c.pc++;
         break;
       }
       case Op::Raw: {
         const Val* v = resolvePlanned(&op, frames, nframes, &scratch);
-        if (stream) appendTextOfJson(out, v);
+        if (stream) { ProfTimer _pt("tpl.raw"); appendTextOfJson(out, v); }
         else appendTextOf(out, v);
         c.pc++;
         break;
@@ -3667,26 +4490,1111 @@ struct Emitter {
   }
 };
 
-// Run one case. Returns false on a structural problem (never for valid
-// input). The output is appended to `out`.
-static bool runCase(Arena* ar, const Val& input, Emitter& out) {
-  const Val* siteV = input.find("site");
-  const Val* templatesV = input.find("templates");
-  const Val* filesV = input.find("files");
-  if (!siteV || siteV->type != Val::Obj || !templatesV || templatesV->type != Val::Obj ||
-      !filesV || filesV->type != Val::Arr)
+// ---------------------------------------------------------------- baked executor (v6 stage 2)
+// Flat build structs (no Val in the hot path) + a compile-time type
+// system that resolves every template path to a direct field chain.
+
+using TocF = Heading;  // the Markdown section's Heading {level, id, html}
+
+struct PagerF { int64_t number = 0, total = 0; Str url, newer_url, older_url; };
+struct TagF {
+  Str name, slug, url;
+  int64_t count = 0;
+  const CardF* posts = nullptr;
+  uint32_t nposts = 0;
+};
+struct PageF {
+  Str title, url, date, date_long, summary, excerpt;
+  int64_t reading_minutes = 1;
+  TagLinkF* tags = nullptr;
+  uint32_t ntags = 0;
+  Str slug, content;
+  TocF* toc = nullptr;
+  uint32_t ntoc = 0;
+  const LinkF* newer = nullptr;
+  const LinkF* older = nullptr;
+  bool is_post = false;
+};
+struct SiteF { Str title, base_url; };
+
+// Value types in the template type environment.
+enum Ty : uint8_t {
+  T_Undef, T_Str, T_Int, T_Dbl, T_Bool, T_Site, T_Card, T_Page, T_Tag, T_TagLink,
+  T_AllTag, T_Toc, T_Pager, T_Link, T_Loop, T_ArrCard, T_ArrTagLink, T_ArrAllTag, T_ArrToc
+};
+
+// Field ids: one (struct, member) pair each.
+enum Fid : uint32_t {
+  F_SiteTitle, F_SiteBaseUrl,
+  F_CardTitle, F_CardUrl, F_CardDate, F_CardDateLong, F_CardSummary, F_CardExcerpt,
+  F_CardReadingMinutes, F_CardTags,
+  F_PageTitle, F_PageUrl, F_PageDate, F_PageDateLong, F_PageSummary, F_PageExcerpt,
+  F_PageReadingMinutes, F_PageTags, F_PageSlug, F_PageContent, F_PageToc, F_PageNewer,
+  F_PageOlder, F_PageIsPost,
+  F_TagName, F_TagSlug, F_TagUrl, F_TagCount, F_TagPosts,
+  F_TagLinkName, F_TagLinkSlug, F_TagLinkUrl, F_TagLinkCount,
+  F_AllTagName, F_AllTagSlug, F_AllTagUrl, F_AllTagCount,
+  F_TocLevel, F_TocId, F_TocHtml,
+  F_PagerNumber, F_PagerTotal, F_PagerUrl, F_PagerNewerUrl, F_PagerOlderUrl,
+  F_LinkTitle, F_LinkUrl, F_LinkDate, F_LinkDateLong
+};
+
+// Field lookup: (type, name) -> (field id, result type). False when the
+// field does not exist on the type (the path is undefined).
+static bool lookupField(Ty ty, Str name, uint32_t& fid, Ty& resultTy) {
+  switch (ty) {
+    case T_Site:
+      if (strEq(name, S("title"))) { fid = F_SiteTitle; resultTy = T_Str; return true; }
+      if (strEq(name, S("base_url"))) { fid = F_SiteBaseUrl; resultTy = T_Str; return true; }
+      return false;
+    case T_Card:
+      if (strEq(name, S("title"))) { fid = F_CardTitle; resultTy = T_Str; return true; }
+      if (strEq(name, S("url"))) { fid = F_CardUrl; resultTy = T_Str; return true; }
+      if (strEq(name, S("date"))) { fid = F_CardDate; resultTy = T_Str; return true; }
+      if (strEq(name, S("date_long"))) { fid = F_CardDateLong; resultTy = T_Str; return true; }
+      if (strEq(name, S("summary"))) { fid = F_CardSummary; resultTy = T_Str; return true; }
+      if (strEq(name, S("excerpt"))) { fid = F_CardExcerpt; resultTy = T_Str; return true; }
+      if (strEq(name, S("reading_minutes"))) { fid = F_CardReadingMinutes; resultTy = T_Int; return true; }
+      if (strEq(name, S("tags"))) { fid = F_CardTags; resultTy = T_ArrTagLink; return true; }
+      return false;
+    case T_Page:
+      if (strEq(name, S("title"))) { fid = F_PageTitle; resultTy = T_Str; return true; }
+      if (strEq(name, S("url"))) { fid = F_PageUrl; resultTy = T_Str; return true; }
+      if (strEq(name, S("date"))) { fid = F_PageDate; resultTy = T_Str; return true; }
+      if (strEq(name, S("date_long"))) { fid = F_PageDateLong; resultTy = T_Str; return true; }
+      if (strEq(name, S("summary"))) { fid = F_PageSummary; resultTy = T_Str; return true; }
+      if (strEq(name, S("excerpt"))) { fid = F_PageExcerpt; resultTy = T_Str; return true; }
+      if (strEq(name, S("reading_minutes"))) { fid = F_PageReadingMinutes; resultTy = T_Int; return true; }
+      if (strEq(name, S("tags"))) { fid = F_PageTags; resultTy = T_ArrTagLink; return true; }
+      if (strEq(name, S("slug"))) { fid = F_PageSlug; resultTy = T_Str; return true; }
+      if (strEq(name, S("content"))) { fid = F_PageContent; resultTy = T_Str; return true; }
+      if (strEq(name, S("toc"))) { fid = F_PageToc; resultTy = T_ArrToc; return true; }
+      if (strEq(name, S("newer"))) { fid = F_PageNewer; resultTy = T_Link; return true; }
+      if (strEq(name, S("older"))) { fid = F_PageOlder; resultTy = T_Link; return true; }
+      if (strEq(name, S("is_post"))) { fid = F_PageIsPost; resultTy = T_Bool; return true; }
+      return false;
+    case T_Tag:
+      if (strEq(name, S("name"))) { fid = F_TagName; resultTy = T_Str; return true; }
+      if (strEq(name, S("slug"))) { fid = F_TagSlug; resultTy = T_Str; return true; }
+      if (strEq(name, S("url"))) { fid = F_TagUrl; resultTy = T_Str; return true; }
+      if (strEq(name, S("count"))) { fid = F_TagCount; resultTy = T_Int; return true; }
+      if (strEq(name, S("posts"))) { fid = F_TagPosts; resultTy = T_ArrCard; return true; }
+      return false;
+    case T_TagLink:
+      if (strEq(name, S("name"))) { fid = F_TagLinkName; resultTy = T_Str; return true; }
+      if (strEq(name, S("slug"))) { fid = F_TagLinkSlug; resultTy = T_Str; return true; }
+      if (strEq(name, S("url"))) { fid = F_TagLinkUrl; resultTy = T_Str; return true; }
+      if (strEq(name, S("count"))) { fid = F_TagLinkCount; resultTy = T_Int; return true; }
+      return false;
+    case T_AllTag:
+      if (strEq(name, S("name"))) { fid = F_AllTagName; resultTy = T_Str; return true; }
+      if (strEq(name, S("slug"))) { fid = F_AllTagSlug; resultTy = T_Str; return true; }
+      if (strEq(name, S("url"))) { fid = F_AllTagUrl; resultTy = T_Str; return true; }
+      if (strEq(name, S("count"))) { fid = F_AllTagCount; resultTy = T_Int; return true; }
+      return false;
+    case T_Toc:
+      if (strEq(name, S("level"))) { fid = F_TocLevel; resultTy = T_Int; return true; }
+      if (strEq(name, S("id"))) { fid = F_TocId; resultTy = T_Str; return true; }
+      if (strEq(name, S("html"))) { fid = F_TocHtml; resultTy = T_Str; return true; }
+      return false;
+    case T_Pager:
+      if (strEq(name, S("number"))) { fid = F_PagerNumber; resultTy = T_Int; return true; }
+      if (strEq(name, S("total"))) { fid = F_PagerTotal; resultTy = T_Int; return true; }
+      if (strEq(name, S("url"))) { fid = F_PagerUrl; resultTy = T_Str; return true; }
+      if (strEq(name, S("newer_url"))) { fid = F_PagerNewerUrl; resultTy = T_Str; return true; }
+      if (strEq(name, S("older_url"))) { fid = F_PagerOlderUrl; resultTy = T_Str; return true; }
+      return false;
+    case T_Link:
+      if (strEq(name, S("title"))) { fid = F_LinkTitle; resultTy = T_Str; return true; }
+      if (strEq(name, S("url"))) { fid = F_LinkUrl; resultTy = T_Str; return true; }
+      if (strEq(name, S("date"))) { fid = F_LinkDate; resultTy = T_Str; return true; }
+      if (strEq(name, S("date_long"))) { fid = F_LinkDateLong; resultTy = T_Str; return true; }
+      return false;
+    default:
+      return false;
+  }
+}
+
+// Element type of an array type (T_Undef when not an array).
+static Ty arrElemTy(Ty arrTy) {
+  switch (arrTy) {
+    case T_ArrCard: return T_Card;
+    case T_ArrTagLink: return T_TagLink;
+    case T_ArrAllTag: return T_AllTag;
+    case T_ArrToc: return T_Toc;
+    default: return T_Undef;
+  }
+}
+
+// A resolved field chain: base op + steps (paths are short; 10 is ample).
+struct ChainOp { uint8_t op; uint32_t arg; };
+// op: 0=BASE_SITE 1=BASE_TAGS 2=BASE_RECENT 3=BASE_PAGE 4=BASE_POSTS 5=BASE_PAGER
+//     6=BASE_TAG 7=BASE_LOOPVAR(slot) 8=BASE_LOOPREC(slot)
+//     9=FIELD(fid) 10=ARRLEN 11=ARRIDX(index) 12=LOOPFIELD(0 index,1 first,2 last,3 length)
+struct Chain { ChainOp ops[10]; uint8_t nops = 0; };
+
+// Runtime value: a tagged union over the flat structs (borrowed, no alloc).
+struct BVal {
+  enum K : uint8_t { Undef, Null, Str, Int, Dbl, Bool, Arr, Obj, Loop } kind = Undef;
+  ::Str s;
+  int64_t i = 0;
+  double d = 0;
+  bool b = false;
+  const void* arr = nullptr;
+  uint32_t arrN = 0;
+  uint8_t arrKind = 0;  // element Ty
+  const void* obj = nullptr;
+  uint8_t objTy = 0;
+  uint32_t loopIdx = 0, loopLen = 0;
+  static BVal undef() { return BVal(); }
+  static BVal nullv() { BVal v; v.kind = Null; return v; }
+  static BVal str(::Str x) { BVal v; v.kind = Str; v.s = x; return v; }
+  static BVal integer(int64_t x) { BVal v; v.kind = Int; v.i = x; return v; }
+  static BVal dbl(double x) { BVal v; v.kind = Dbl; v.d = x; return v; }
+  static BVal boolean(bool x) { BVal v; v.kind = Bool; v.b = x; return v; }
+  static BVal objv(const void* p, uint8_t ty) { BVal v; v.kind = Obj; v.obj = p; v.objTy = ty; return v; }
+  static BVal arrv(const void* p, uint32_t n, uint8_t ek) { BVal v; v.kind = Arr; v.arr = p; v.arrN = n; v.arrKind = ek; return v; }
+  static BVal loopv(uint32_t idx, uint32_t len) { BVal v; v.kind = Loop; v.loopIdx = idx; v.loopLen = len; return v; }
+};
+
+// Element i of an array BVal, as a BVal.
+static BVal bvalArrElem(const BVal& v, uint32_t i) {
+  if (v.kind != BVal::Arr || i >= v.arrN) return BVal::undef();
+  switch (v.arrKind) {
+    case T_Card: return BVal::objv(&((const CardF*)v.arr)[i], T_Card);
+    case T_TagLink: return BVal::objv(&((const TagLinkF*)v.arr)[i], T_TagLink);
+    case T_AllTag: return BVal::objv(&((const TagLinkF*)v.arr)[i], T_AllTag);
+    case T_Toc: return BVal::objv(&((const TocF*)v.arr)[i], T_Toc);
+    default: return BVal::undef();
+  }
+}
+
+// One field access on an object BVal (fid implies the struct type).
+static BVal applyField(const void* obj, uint32_t fid) {
+  switch (fid) {
+    case F_SiteTitle: return BVal::str(((const SiteF*)obj)->title);
+    case F_SiteBaseUrl: return BVal::str(((const SiteF*)obj)->base_url);
+    case F_CardTitle: return BVal::str(((const CardF*)obj)->title);
+    case F_CardUrl: return BVal::str(((const CardF*)obj)->url);
+    case F_CardDate: return BVal::str(((const CardF*)obj)->date);
+    case F_CardDateLong: return BVal::str(((const CardF*)obj)->date_long);
+    case F_CardSummary: return BVal::str(((const CardF*)obj)->summary);
+    case F_CardExcerpt: return BVal::str(((const CardF*)obj)->excerpt);
+    case F_CardReadingMinutes: return BVal::integer(((const CardF*)obj)->reading_minutes);
+    case F_CardTags: { const CardF* c = (const CardF*)obj; return BVal::arrv(c->tags, c->ntags, T_TagLink); }
+    case F_PageTitle: return BVal::str(((const PageF*)obj)->title);
+    case F_PageUrl: return BVal::str(((const PageF*)obj)->url);
+    case F_PageDate: return BVal::str(((const PageF*)obj)->date);
+    case F_PageDateLong: return BVal::str(((const PageF*)obj)->date_long);
+    case F_PageSummary: return BVal::str(((const PageF*)obj)->summary);
+    case F_PageExcerpt: return BVal::str(((const PageF*)obj)->excerpt);
+    case F_PageReadingMinutes: return BVal::integer(((const PageF*)obj)->reading_minutes);
+    case F_PageTags: { const PageF* p = (const PageF*)obj; return BVal::arrv(p->tags, p->ntags, T_TagLink); }
+    case F_PageSlug: return BVal::str(((const PageF*)obj)->slug);
+    case F_PageContent: return BVal::str(((const PageF*)obj)->content);
+    case F_PageToc: { const PageF* p = (const PageF*)obj; return BVal::arrv(p->toc, p->ntoc, T_Toc); }
+    case F_PageNewer: { const LinkF* l = ((const PageF*)obj)->newer; return l ? BVal::objv(l, T_Link) : BVal::nullv(); }
+    case F_PageOlder: { const LinkF* l = ((const PageF*)obj)->older; return l ? BVal::objv(l, T_Link) : BVal::nullv(); }
+    case F_PageIsPost: return BVal::boolean(((const PageF*)obj)->is_post);
+    case F_TagName: return BVal::str(((const TagF*)obj)->name);
+    case F_TagSlug: return BVal::str(((const TagF*)obj)->slug);
+    case F_TagUrl: return BVal::str(((const TagF*)obj)->url);
+    case F_TagCount: return BVal::integer(((const TagF*)obj)->count);
+    case F_TagPosts: { const TagF* t = (const TagF*)obj; return BVal::arrv(t->posts, t->nposts, T_Card); }
+    case F_TagLinkName: return BVal::str(((const TagLinkF*)obj)->name);
+    case F_TagLinkSlug: return BVal::str(((const TagLinkF*)obj)->slug);
+    case F_TagLinkUrl: return BVal::str(((const TagLinkF*)obj)->url);
+    case F_TagLinkCount: { const TagLinkF* t = (const TagLinkF*)obj; return t->hasCount ? BVal::integer(t->count) : BVal::undef(); }
+    case F_AllTagName: return BVal::str(((const TagLinkF*)obj)->name);
+    case F_AllTagSlug: return BVal::str(((const TagLinkF*)obj)->slug);
+    case F_AllTagUrl: return BVal::str(((const TagLinkF*)obj)->url);
+    case F_AllTagCount: return BVal::integer(((const TagLinkF*)obj)->count);
+    case F_TocLevel: return BVal::integer(((const TocF*)obj)->level);
+    case F_TocId: return BVal::str(((const TocF*)obj)->id);
+    case F_TocHtml: return BVal::str(((const TocF*)obj)->html);
+    case F_PagerNumber: return BVal::integer(((const PagerF*)obj)->number);
+    case F_PagerTotal: return BVal::integer(((const PagerF*)obj)->total);
+    case F_PagerUrl: return BVal::str(((const PagerF*)obj)->url);
+    case F_PagerNewerUrl: return BVal::str(((const PagerF*)obj)->newer_url);
+    case F_PagerOlderUrl: return BVal::str(((const PagerF*)obj)->older_url);
+    case F_LinkTitle: return BVal::str(((const LinkF*)obj)->title);
+    case F_LinkUrl: return BVal::str(((const LinkF*)obj)->url);
+    case F_LinkDate: return BVal::str(((const LinkF*)obj)->date);
+    case F_LinkDateLong: return BVal::str(((const LinkF*)obj)->date_long);
+    default: return BVal::undef();
+  }
+}
+
+// One chain step on a BVal (Undef/Null short-circuit to Undef).
+static BVal applyStep(const BVal& v, const ChainOp& op) {
+  if (v.kind == BVal::Undef || v.kind == BVal::Null) return BVal::undef();
+  switch (op.op) {
+    case 9:  // FIELD
+      if (v.kind != BVal::Obj) return BVal::undef();
+      return applyField(v.obj, op.arg);
+    case 10:  // ARRLEN
+      if (v.kind != BVal::Arr) return BVal::undef();
+      return BVal::integer(v.arrN);
+    case 11:  // ARRIDX
+      if (v.kind != BVal::Arr) return BVal::undef();
+      if (op.arg >= v.arrN) return BVal::undef();
+      return bvalArrElem(v, op.arg);
+    case 12:  // LOOPFIELD
+      if (v.kind != BVal::Loop) return BVal::undef();
+      if (op.arg == 0) return BVal::integer((int64_t)v.loopIdx + 1);
+      if (op.arg == 1) return BVal::boolean(v.loopIdx == 0);
+      if (op.arg == 2) return BVal::boolean(v.loopIdx + 1 == v.loopLen);
+      return BVal::integer(v.loopLen);
+    default:
+      return BVal::undef();
+  }
+}
+
+// The reference's truthy on a BVal (Arr is falsy when empty; NaN truthy).
+static bool truthyB(const BVal& v) {
+  switch (v.kind) {
+    case BVal::Undef:
+    case BVal::Null: return false;
+    case BVal::Bool: return v.b;
+    case BVal::Str: return v.s.n > 0;
+    case BVal::Int: return v.i != 0;
+    case BVal::Dbl: return v.d != 0;
+    case BVal::Arr: return v.arrN > 0;
+    default: return true;  // Obj, Loop
+  }
+}
+
+// textOf (JS String(value)) in its four escape modes.
+static void appendBValText(Buf& out, const BVal& v);
+static void appendBValEscaped(Buf& out, const BVal& v);
+static void appendBValJson(Buf& out, const BVal& v);
+static void appendBValEscapedJson(Buf& out, const BVal& v);
+static void appendBValMode(Buf& out, const BVal& v, int mode) {
+  // mode 0 = raw, 1 = HTML-escaped, 2 = JSON-escaped, 3 = HTML+JSON-escaped
+  if (!v.kind) return;
+  switch (v.kind) {
+    case BVal::Str:
+      if (mode == 0) out.append(v.s);
+      else if (mode == 1) appendEscaped(out, v.s);
+      else if (mode == 2) appendJsonEscaped(out, v.s);
+      else appendEscapedJson(out, v.s);
+      break;
+    case BVal::Int: out.appendInt(v.i); break;
+    case BVal::Dbl: appendJsNum(out, v.d); break;
+    case BVal::Bool: out.append(v.b ? "true" : "false"); break;
+    case BVal::Arr:
+      for (uint32_t k = 0; k < v.arrN; k++) {
+        if (k) out.append(", ");
+        appendBValMode(out, bvalArrElem(v, k), mode);
+      }
+      break;
+    default: break;  // Null, Obj, Loop, Undef -> ""
+  }
+}
+static void appendBValText(Buf& out, const BVal& v) { appendBValMode(out, v, 0); }
+static void appendBValEscaped(Buf& out, const BVal& v) { appendBValMode(out, v, 1); }
+static void appendBValJson(Buf& out, const BVal& v) { appendBValMode(out, v, 2); }
+static void appendBValEscapedJson(Buf& out, const BVal& v) { appendBValMode(out, v, 3); }
+
+// ---------------------------------------------------------------- skeletonizer (v6 stage 2)
+// Compiles each template's op-list into a skeleton: static fragments
+// (pre-rendered once per case, already JSON-escaped) + dynamic ops with
+// direct field chains. Static If/For over case-global data (site, tags,
+// recent) are evaluated at build time; static Var/Raw values are baked
+// into the fragments. Only hole data (page/posts/pager/tag, loop
+// elements over hole arrays) stays dynamic.
+
+// Render kinds (which root vars exist).
+// 0 = page/post render (page), 1 = index render (posts+pager),
+// 2 = tag render (tag), 3 = tags-index render (neither).
+
+// ---- direct field accessor (Stage 4) ----
+// A Var/Raw whose chain is a single field access on a known struct (or a
+// page.newer/older + LinkF field, or a loop-record field) is resolved to a
+// direct (base pointer + byte offset) access at skeleton build time, so
+// the executor does one pointer add + the escape instead of a Chain walk
+// + applyField switches + BVal copies. The frame index is the ChainOp
+// arg, exactly as baseValue uses it, so the fast and slow paths agree.
+struct FastAcc {
+  uint8_t slot = 255;  // 255=invalid; 0=site,1=page,2=pager,3=tag,4=loopElem,5=loopRec
+  uint8_t fieldKind = 0;  // 0=Str, 1=Int64, 2=Bool, 3=Int32
+  uint8_t frameIdx = 0;   // loopElem/loopRec: RCtx.frames index
+  uint8_t loopField = 0;  // loopRec: 0=index,1=first,2=last,3=length
+  bool isCount = false;   // TagLink.count: emit only when hasCount
+  bool isLink2 = false;   // page.newer/older + LinkF field
+  uint16_t offset = 0;    // field offset (or offset1 for isLink2)
+  uint16_t offset2 = 0;   // LinkF field offset (isLink2)
+  uint16_t elemSize = 0;  // loopElem: element size
+};
+// fid -> (byte offset in its struct, field kind, isCount). Arr/Obj fields
+// (tags/posts/toc/newer/older) return false: they are not scalar values.
+static bool fieldInfo(uint32_t fid, uint16_t& offset, uint8_t& kind, bool& isCount) {
+  isCount = false;
+  switch (fid) {
+    case F_SiteTitle: offset = (uint16_t)offsetof(SiteF, title); kind = 0; return true;
+    case F_SiteBaseUrl: offset = (uint16_t)offsetof(SiteF, base_url); kind = 0; return true;
+    case F_CardTitle: offset = (uint16_t)offsetof(CardF, title); kind = 0; return true;
+    case F_CardUrl: offset = (uint16_t)offsetof(CardF, url); kind = 0; return true;
+    case F_CardDate: offset = (uint16_t)offsetof(CardF, date); kind = 0; return true;
+    case F_CardDateLong: offset = (uint16_t)offsetof(CardF, date_long); kind = 0; return true;
+    case F_CardSummary: offset = (uint16_t)offsetof(CardF, summary); kind = 0; return true;
+    case F_CardExcerpt: offset = (uint16_t)offsetof(CardF, excerpt); kind = 0; return true;
+    case F_CardReadingMinutes: offset = (uint16_t)offsetof(CardF, reading_minutes); kind = 1; return true;
+    case F_PageTitle: offset = (uint16_t)offsetof(PageF, title); kind = 0; return true;
+    case F_PageUrl: offset = (uint16_t)offsetof(PageF, url); kind = 0; return true;
+    case F_PageDate: offset = (uint16_t)offsetof(PageF, date); kind = 0; return true;
+    case F_PageDateLong: offset = (uint16_t)offsetof(PageF, date_long); kind = 0; return true;
+    case F_PageSummary: offset = (uint16_t)offsetof(PageF, summary); kind = 0; return true;
+    case F_PageExcerpt: offset = (uint16_t)offsetof(PageF, excerpt); kind = 0; return true;
+    case F_PageReadingMinutes: offset = (uint16_t)offsetof(PageF, reading_minutes); kind = 1; return true;
+    case F_PageSlug: offset = (uint16_t)offsetof(PageF, slug); kind = 0; return true;
+    case F_PageContent: offset = (uint16_t)offsetof(PageF, content); kind = 0; return true;
+    case F_PageIsPost: offset = (uint16_t)offsetof(PageF, is_post); kind = 2; return true;
+    case F_TagName: offset = (uint16_t)offsetof(TagF, name); kind = 0; return true;
+    case F_TagSlug: offset = (uint16_t)offsetof(TagF, slug); kind = 0; return true;
+    case F_TagUrl: offset = (uint16_t)offsetof(TagF, url); kind = 0; return true;
+    case F_TagCount: offset = (uint16_t)offsetof(TagF, count); kind = 1; return true;
+    case F_TagLinkName: offset = (uint16_t)offsetof(TagLinkF, name); kind = 0; return true;
+    case F_TagLinkSlug: offset = (uint16_t)offsetof(TagLinkF, slug); kind = 0; return true;
+    case F_TagLinkUrl: offset = (uint16_t)offsetof(TagLinkF, url); kind = 0; return true;
+    case F_TagLinkCount: offset = (uint16_t)offsetof(TagLinkF, count); kind = 1; isCount = true; return true;
+    case F_AllTagName: offset = (uint16_t)offsetof(TagLinkF, name); kind = 0; return true;
+    case F_AllTagSlug: offset = (uint16_t)offsetof(TagLinkF, slug); kind = 0; return true;
+    case F_AllTagUrl: offset = (uint16_t)offsetof(TagLinkF, url); kind = 0; return true;
+    case F_AllTagCount: offset = (uint16_t)offsetof(TagLinkF, count); kind = 1; return true;
+    case F_TocLevel: offset = (uint16_t)offsetof(TocF, level); kind = 3; return true;
+    case F_TocId: offset = (uint16_t)offsetof(TocF, id); kind = 0; return true;
+    case F_TocHtml: offset = (uint16_t)offsetof(TocF, html); kind = 0; return true;
+    case F_PagerNumber: offset = (uint16_t)offsetof(PagerF, number); kind = 1; return true;
+    case F_PagerTotal: offset = (uint16_t)offsetof(PagerF, total); kind = 1; return true;
+    case F_PagerUrl: offset = (uint16_t)offsetof(PagerF, url); kind = 0; return true;
+    case F_PagerNewerUrl: offset = (uint16_t)offsetof(PagerF, newer_url); kind = 0; return true;
+    case F_PagerOlderUrl: offset = (uint16_t)offsetof(PagerF, older_url); kind = 0; return true;
+    case F_LinkTitle: offset = (uint16_t)offsetof(LinkF, title); kind = 0; return true;
+    case F_LinkUrl: offset = (uint16_t)offsetof(LinkF, url); kind = 0; return true;
+    case F_LinkDate: offset = (uint16_t)offsetof(LinkF, date); kind = 0; return true;
+    case F_LinkDateLong: offset = (uint16_t)offsetof(LinkF, date_long); kind = 0; return true;
+    default: return false;
+  }
+}
+
+struct Seg {
+  enum K : uint8_t { Frag, Var, Raw, If, For, Include } kind;
+  Str frag;      // Frag: raw text
+  Str escFrag;   // Frag: JSON-escaped text (stream mode)
+  Chain chain;   // Var/Raw/If/For
+  FastAcc fast;  // Var/Raw: direct field accessor (slot 255 = slow path)
+  bool neg = false;  // If: "not"
+  Seg* thenSegs = nullptr;
+  uint32_t nThen = 0;  // If then-branch / For body
+  Seg* elseSegs = nullptr;
+  uint32_t nElse = 0;  // If else-branch
+  int32_t skelIdx = -1;  // Include
+};
+struct Skel { Seg* segs = nullptr; uint32_t nsegs = 0; };
+
+struct CCtx {
+  int renderKind = 0;
+  struct Bind {
+    Str varName;
+    uint8_t elemTy = T_Undef;
+    bool isStatic = false;
+    BVal staticElem;
+    uint32_t staticIdx = 0, staticLen = 0;
+  };
+  Bind binds[16];
+  int nbinds = 0;
+  SiteF site;
+  const TagLinkF* allTags = nullptr;
+  uint32_t nAllTags = 0;
+  const CardF* recent = nullptr;
+  uint32_t nRecent = 0;
+  Arena* ar = nullptr;
+  struct SkelCache* cache = nullptr;
+};
+
+struct SkelEntry {
+  int32_t tplIdx = -1;
+  int renderKind = 0;
+  CCtx::Bind binds[16];
+  int nbinds = 0;
+  int32_t skelIdx = -1;
+  bool done = false;
+};
+struct SkelCache {
+  Template* tpls = nullptr;
+  bool* tplOk = nullptr;
+  uint32_t ntpls = 0;
+  Arena* ar = nullptr;
+  Skel* skels = nullptr;
+  uint32_t nskels = 0, capSkels = 0;
+  SkelEntry* entries = nullptr;
+  uint32_t nentries = 0, capEntries = 0;
+};
+
+// Runtime render context: case-global data + the hole data for this
+// render + the loop frames.
+struct LoopFrame {
+  const void* arr = nullptr;
+  uint32_t len = 0;
+  uint8_t arrKind = 0;
+  uint32_t idx = 0;
+};
+struct RCtx {
+  SiteF site;
+  const TagLinkF* allTags = nullptr;
+  uint32_t nAllTags = 0;
+  const CardF* recent = nullptr;
+  uint32_t nRecent = 0;
+  const PageF* page = nullptr;
+  const CardF* posts = nullptr;
+  uint32_t nPosts = 0;
+  bool hasPosts = false;
+  const PagerF* pager = nullptr;
+  const TagF* tag = nullptr;
+  LoopFrame frames[16];
+  uint32_t nframes = 0;
+};
+static bool tryFastAcc(const Chain& ch, const CCtx& ctx, FastAcc& fa) {
+  fa = FastAcc();
+  if (ch.nops < 2) return false;
+  const ChainOp& base = ch.ops[0];
+  if (ch.nops == 2 && ch.ops[1].op == 9) {
+    uint16_t off;
+    uint8_t kind;
+    bool isCount;
+    if (!fieldInfo(ch.ops[1].arg, off, kind, isCount)) return false;
+    uint32_t fid = ch.ops[1].arg;
+    if (base.op == 0) {
+      if (fid > F_SiteBaseUrl) return false;
+      fa.slot = 0; fa.offset = off; fa.fieldKind = kind; return true;
+    }
+    if (base.op == 3) {
+      if (fid < F_PageTitle || fid > F_PageIsPost) return false;
+      fa.slot = 1; fa.offset = off; fa.fieldKind = kind; return true;
+    }
+    if (base.op == 5) {
+      if (fid < F_PagerNumber || fid > F_PagerOlderUrl) return false;
+      fa.slot = 2; fa.offset = off; fa.fieldKind = kind; return true;
+    }
+    if (base.op == 6) {
+      if (fid < F_TagName || fid > F_TagPosts) return false;
+      fa.slot = 3; fa.offset = off; fa.fieldKind = kind; return true;
+    }
+    if (base.op == 7) {
+      if (base.arg >= (uint32_t)ctx.nbinds) return false;
+      uint32_t elemTy = ctx.binds[base.arg].elemTy;
+      uint16_t elemSize = 0;
+      if (elemTy == T_Card) {
+        if (fid < F_CardTitle || fid > F_CardTags) return false;
+        elemSize = (uint16_t)sizeof(CardF);
+      } else if (elemTy == T_TagLink || elemTy == T_AllTag) {
+        bool isTL = (fid >= F_TagLinkName && fid <= F_TagLinkCount);
+        bool isAT = (fid >= F_AllTagName && fid <= F_AllTagCount);
+        if (!isTL && !isAT) return false;
+        elemSize = (uint16_t)sizeof(TagLinkF);
+      } else if (elemTy == T_Toc) {
+        if (fid < F_TocLevel || fid > F_TocHtml) return false;
+        elemSize = (uint16_t)sizeof(TocF);
+      } else return false;
+      fa.slot = 4; fa.frameIdx = (uint8_t)base.arg; fa.offset = off;
+      fa.fieldKind = kind; fa.isCount = isCount; fa.elemSize = elemSize;
+      return true;
+    }
     return false;
+  }
+  if (ch.nops == 2 && base.op == 8 && ch.ops[1].op == 12) {
+    fa.slot = 5; fa.frameIdx = (uint8_t)base.arg; fa.loopField = (uint8_t)ch.ops[1].arg;
+    fa.fieldKind = (ch.ops[1].arg == 0 || ch.ops[1].arg == 3) ? 1 : 2;
+    return true;
+  }
+  if (ch.nops == 3 && base.op == 3 && ch.ops[1].op == 9 && ch.ops[2].op == 9) {
+    uint32_t f1 = ch.ops[1].arg, f2 = ch.ops[2].arg;
+    if (f1 != F_PageNewer && f1 != F_PageOlder) return false;
+    if (f2 < F_LinkTitle || f2 > F_LinkDateLong) return false;
+    uint16_t off2;
+    uint8_t kind;
+    bool ic;
+    if (!fieldInfo(f2, off2, kind, ic)) return false;
+    fa.slot = 1; fa.isLink2 = true;
+    fa.offset = (uint16_t)(f1 == F_PageNewer ? offsetof(PageF, newer) : offsetof(PageF, older));
+    fa.offset2 = off2; fa.fieldKind = kind;
+    return true;
+  }
+  return false;
+}
+static void appendFast(Buf& out, const FastAcc& fa, RCtx& ctx, int mode) {
+  // mode: 0=raw, 1=HTML, 2=JSON, 3=HTML+JSON (same as appendBValMode).
+  const void* base = nullptr;
+  int64_t ival = 0;
+  bool bval = false;
+  Str sval;
+  bool isStr = false, isInt = false, isBool = false;
+  if (fa.slot == 5) {
+    if (fa.frameIdx >= ctx.nframes) return;
+    const LoopFrame& f = ctx.frames[fa.frameIdx];
+    if (fa.loopField == 0) { isInt = true; ival = (int64_t)f.idx + 1; }
+    else if (fa.loopField == 1) { isBool = true; bval = (f.idx == 0); }
+    else if (fa.loopField == 2) { isBool = true; bval = (f.idx + 1 == f.len); }
+    else { isInt = true; ival = (int64_t)f.len; }
+  } else {
+    if (fa.slot == 0) base = &ctx.site;
+    else if (fa.slot == 1) { if (!ctx.page) return; base = ctx.page; }
+    else if (fa.slot == 2) { if (!ctx.pager) return; base = ctx.pager; }
+    else if (fa.slot == 3) { if (!ctx.tag) return; base = ctx.tag; }
+    else if (fa.slot == 4) {
+      if (fa.frameIdx >= ctx.nframes) return;
+      const LoopFrame& f = ctx.frames[fa.frameIdx];
+      base = (const char*)f.arr + (size_t)f.idx * fa.elemSize;
+    } else return;
+    if (fa.isLink2) {
+      const LinkF* l = *(const LinkF**)((const char*)base + fa.offset);
+      if (!l) return;
+      if (fa.fieldKind == 0) { isStr = true; sval = *(const Str*)((const char*)l + fa.offset2); }
+      else if (fa.fieldKind == 1) { isInt = true; ival = *(const int64_t*)((const char*)l + fa.offset2); }
+      else if (fa.fieldKind == 3) { isInt = true; ival = *(const int*)((const char*)l + fa.offset2); }
+      else { isBool = true; bval = *(const bool*)((const char*)l + fa.offset2); }
+    } else if (fa.isCount) {
+      const TagLinkF* t = (const TagLinkF*)base;
+      if (!t->hasCount) return;
+      isInt = true; ival = t->count;
+    } else if (fa.fieldKind == 0) {
+      isStr = true; sval = *(const Str*)((const char*)base + fa.offset);
+    } else if (fa.fieldKind == 1) {
+      isInt = true; ival = *(const int64_t*)((const char*)base + fa.offset);
+    } else if (fa.fieldKind == 3) {
+      isInt = true; ival = *(const int*)((const char*)base + fa.offset);
+    } else {
+      isBool = true; bval = *(const bool*)((const char*)base + fa.offset);
+    }
+  }
+  if (isStr) {
+    if (mode == 0) out.append(sval);
+    else if (mode == 1) appendEscaped(out, sval);
+    else if (mode == 2) appendJsonEscaped(out, sval);
+    else appendEscapedJson(out, sval);
+  } else if (isInt) {
+    out.appendInt(ival);
+  } else if (isBool) {
+    out.append(bval ? "true" : "false");
+  }
+}
+
+
+// Resolve a path against the compile-time type environment. Returns
+// false when the path is undefined in this context. `isStatic` is true
+// when the value comes only from case-global data (site/tags/recent or
+// a statically-bound loop var).
+static bool resolvePathType(Str* path, uint8_t npath, CCtx& ctx, Chain& ch, Ty& finalTy,
+                            bool& isStatic) {
+  if (npath == 0 || npath > 10) return false;
+  ch.nops = 0;
+  Ty cur;
+  bool stat = false;
+  Str seg0 = path[0];
+  if (strEq(seg0, S("site"))) {
+    ch.ops[ch.nops++] = ChainOp{0, 0};
+    cur = T_Site;
+    stat = true;
+  } else if (strEq(seg0, S("tags"))) {
+    ch.ops[ch.nops++] = ChainOp{1, 0};
+    cur = T_ArrAllTag;
+    stat = true;
+  } else if (strEq(seg0, S("recent"))) {
+    ch.ops[ch.nops++] = ChainOp{2, 0};
+    cur = T_ArrCard;
+    stat = true;
+  } else if (strEq(seg0, S("page"))) {
+    if (ctx.renderKind != 0) return false;
+    ch.ops[ch.nops++] = ChainOp{3, 0};
+    cur = T_Page;
+    stat = false;
+  } else if (strEq(seg0, S("posts"))) {
+    if (ctx.renderKind != 1) return false;
+    ch.ops[ch.nops++] = ChainOp{4, 0};
+    cur = T_ArrCard;
+    stat = false;
+  } else if (strEq(seg0, S("pager"))) {
+    if (ctx.renderKind != 1) return false;
+    ch.ops[ch.nops++] = ChainOp{5, 0};
+    cur = T_Pager;
+    stat = false;
+  } else if (strEq(seg0, S("tag"))) {
+    if (ctx.renderKind != 2) return false;
+    ch.ops[ch.nops++] = ChainOp{6, 0};
+    cur = T_Tag;
+    stat = false;
+  } else if (strEq(seg0, S("loop"))) {
+    if (ctx.nbinds == 0) return false;
+    ch.ops[ch.nops++] = ChainOp{8, (uint32_t)(ctx.nbinds - 1)};
+    cur = T_Loop;
+    stat = ctx.binds[ctx.nbinds - 1].isStatic;
+  } else {
+    int slot = -1;
+    for (int f = ctx.nbinds - 1; f >= 0; f--) {
+      if (strEq(ctx.binds[f].varName, seg0)) {
+        slot = f;
+        break;
+      }
+    }
+    if (slot < 0) return false;
+    ch.ops[ch.nops++] = ChainOp{7, (uint32_t)slot};
+    cur = (Ty)ctx.binds[slot].elemTy;
+    stat = ctx.binds[slot].isStatic;
+  }
+  for (uint8_t k = 1; k < npath; k++) {
+    Str seg = path[k];
+    if (cur == T_Loop) {
+      uint32_t fld;
+      if (strEq(seg, S("index"))) fld = 0;
+      else if (strEq(seg, S("first"))) fld = 1;
+      else if (strEq(seg, S("last"))) fld = 2;
+      else if (strEq(seg, S("length"))) fld = 3;
+      else return false;
+      ch.ops[ch.nops++] = ChainOp{12, fld};
+      cur = (fld == 0 || fld == 3) ? T_Int : T_Bool;
+      continue;
+    }
+    if (cur == T_ArrCard || cur == T_ArrTagLink || cur == T_ArrAllTag || cur == T_ArrToc) {
+      if (strEq(seg, S("length"))) {
+        ch.ops[ch.nops++] = ChainOp{10, 0};
+        cur = T_Int;
+        continue;
+      }
+      if (seg.n > 0) {
+        bool digits = true;
+        for (uint32_t q = 0; q < seg.n; q++)
+          if (seg.p[q] < '0' || seg.p[q] > '9') {
+            digits = false;
+            break;
+          }
+        if (digits && !(seg.n > 1 && seg.p[0] == '0')) {
+          uint64_t idx = 0;
+          for (uint32_t q = 0; q < seg.n; q++) idx = idx * 10 + (uint64_t)(seg.p[q] - '0');
+          if (idx > 0xFFFFFFFFull) return false;
+          ch.ops[ch.nops++] = ChainOp{11, (uint32_t)idx};
+          cur = arrElemTy(cur);
+          continue;
+        }
+      }
+      return false;
+    }
+    uint32_t fid;
+    Ty rty;
+    if (!lookupField(cur, seg, fid, rty)) return false;
+    ch.ops[ch.nops++] = ChainOp{9, fid};
+    cur = rty;
+  }
+  finalTy = cur;
+  isStatic = stat;
+  return true;
+}
+
+// Static evaluation: the chain's base against the compile-time data.
+static BVal evalStaticBase(const ChainOp& op, CCtx& ctx) {
+  switch (op.op) {
+    case 0: return BVal::objv(&ctx.site, T_Site);
+    case 1: return BVal::arrv(ctx.allTags, ctx.nAllTags, T_AllTag);
+    case 2: return BVal::arrv(ctx.recent, ctx.nRecent, T_Card);
+    case 7: {
+      if (op.arg >= (uint32_t)ctx.nbinds) return BVal::undef();
+      return ctx.binds[op.arg].staticElem;
+    }
+    case 8: {
+      if (op.arg >= (uint32_t)ctx.nbinds) return BVal::undef();
+      return BVal::loopv(ctx.binds[op.arg].staticIdx, ctx.binds[op.arg].staticLen);
+    }
+    default: return BVal::undef();  // hole vars are never static
+  }
+}
+static BVal evalStaticChain(const Chain& ch, CCtx& ctx) {
+  if (ch.nops == 0) return BVal::undef();
+  BVal v = evalStaticBase(ch.ops[0], ctx);
+  for (uint8_t k = 1; k < ch.nops; k++) {
+    v = applyStep(v, ch.ops[k]);
+    if (v.kind == BVal::Undef) return v;
+  }
+  return v;
+}
+
+// Runtime chain resolution against the render context.
+static BVal baseValue(const ChainOp& op, RCtx& ctx) {
+  switch (op.op) {
+    case 0: return BVal::objv(&ctx.site, T_Site);
+    case 1: return BVal::arrv(ctx.allTags, ctx.nAllTags, T_AllTag);
+    case 2: return BVal::arrv(ctx.recent, ctx.nRecent, T_Card);
+    case 3: return ctx.page ? BVal::objv(ctx.page, T_Page) : BVal::undef();
+    case 4: return ctx.hasPosts ? BVal::arrv(ctx.posts, ctx.nPosts, T_Card) : BVal::undef();
+    case 5: return ctx.pager ? BVal::objv(ctx.pager, T_Pager) : BVal::undef();
+    case 6: return ctx.tag ? BVal::objv(ctx.tag, T_Tag) : BVal::undef();
+    case 7: {
+      if (op.arg >= ctx.nframes) return BVal::undef();
+      const LoopFrame& f = ctx.frames[op.arg];
+      return bvalArrElem(BVal::arrv(f.arr, f.len, f.arrKind), f.idx);
+    }
+    case 8: {
+      if (op.arg >= ctx.nframes) return BVal::undef();
+      const LoopFrame& f = ctx.frames[op.arg];
+      return BVal::loopv(f.idx, f.len);
+    }
+    default: return BVal::undef();
+  }
+}
+static BVal resolveChain(const Chain& ch, RCtx& ctx) {
+  if (ch.nops == 0) return BVal::undef();
+  BVal v = baseValue(ch.ops[0], ctx);
+  for (uint8_t k = 1; k < ch.nops; k++) {
+    v = applyStep(v, ch.ops[k]);
+    if (v.kind == BVal::Undef) return v;
+  }
+  return v;
+}
+
+// ---- skeleton building ----
+
+struct SegBuf {
+  Seg* segs = nullptr;
+  uint32_t n = 0, cap = 0;
+  Arena* ar = nullptr;
+  void add(const Seg& s) {
+    if (n == cap) {
+      cap = cap ? cap * 2 : 16;
+      Seg* ni = ar->allocArr<Seg>(cap);
+      if (segs) std::memcpy(ni, segs, sizeof(Seg) * n);
+      segs = ni;
+    }
+    segs[n++] = s;
+  }
+};
+
+static void flushFrag(SegBuf& out, Buf& frag, Arena* ar) {
+  if (frag.len == 0) return;
+  Buf esc;
+  appendJsonEscaped(esc, frag.view());
+  Seg s;
+  s.kind = Seg::Frag;
+  s.frag = ar->dup(frag.view());
+  s.escFrag = ar->dup(esc.view());
+  out.add(s);
+  frag.reset();
+}
+
+static bool bvalKeyEq(const BVal& a, const BVal& b) {
+  if (a.kind != b.kind) return false;
+  switch (a.kind) {
+    case BVal::Str: return strEq(a.s, b.s);
+    case BVal::Int: return a.i == b.i;
+    case BVal::Dbl: return a.d == b.d;
+    case BVal::Bool: return a.b == b.b;
+    case BVal::Arr: return a.arr == b.arr && a.arrN == b.arrN && a.arrKind == b.arrKind;
+    case BVal::Obj: return a.obj == b.obj && a.objTy == b.objTy;
+    case BVal::Loop: return a.loopIdx == b.loopIdx && a.loopLen == b.loopLen;
+    default: return true;
+  }
+}
+static bool bindsEq(const CCtx::Bind* a, int na, const CCtx::Bind* b, int nb) {
+  if (na != nb) return false;
+  for (int i = 0; i < na; i++) {
+    if (!strEq(a[i].varName, b[i].varName)) return false;
+    if (a[i].elemTy != b[i].elemTy) return false;
+    if (a[i].isStatic != b[i].isStatic) return false;
+    if (a[i].isStatic) {
+      if (!bvalKeyEq(a[i].staticElem, b[i].staticElem)) return false;
+      if (a[i].staticIdx != b[i].staticIdx || a[i].staticLen != b[i].staticLen) return false;
+    }
+  }
+  return true;
+}
+
+static void buildSegs(Template& t, uint32_t pc, uint32_t endPc, CCtx& ctx, SegBuf& out,
+                      Buf& frag);
+static int32_t getOrCompileSkel(int32_t tplIdx, CCtx& ctx) {
+  SkelCache& cache = *ctx.cache;
+  for (uint32_t i = 0; i < cache.nentries; i++) {
+    SkelEntry& e = cache.entries[i];
+    if (e.tplIdx == tplIdx && e.renderKind == ctx.renderKind &&
+        bindsEq(e.binds, e.nbinds, ctx.binds, ctx.nbinds)) {
+      return e.skelIdx;  // may be in-progress; the runtime depth limit handles cycles
+    }
+  }
+  if (cache.nskels == cache.capSkels) {
+    cache.capSkels = cache.capSkels ? cache.capSkels * 2 : 32;
+    Skel* ni = cache.ar->allocArr<Skel>(cache.capSkels);
+    if (cache.skels) std::memcpy(ni, cache.skels, sizeof(Skel) * cache.nskels);
+    cache.skels = ni;
+  }
+  int32_t skelIdx = (int32_t)cache.nskels++;
+  cache.skels[skelIdx] = Skel();
+  if (cache.nentries == cache.capEntries) {
+    cache.capEntries = cache.capEntries ? cache.capEntries * 2 : 32;
+    SkelEntry* ni = cache.ar->allocArr<SkelEntry>(cache.capEntries);
+    if (cache.entries) std::memcpy(ni, cache.entries, sizeof(SkelEntry) * cache.nentries);
+    cache.entries = ni;
+  }
+  SkelEntry& e = cache.entries[cache.nentries++];
+  e = SkelEntry();
+  e.tplIdx = tplIdx;
+  e.renderKind = ctx.renderKind;
+  e.nbinds = ctx.nbinds;
+  for (int i = 0; i < ctx.nbinds; i++) e.binds[i] = ctx.binds[i];
+  e.skelIdx = skelIdx;
+  e.done = false;
+  Template& t = cache.tpls[tplIdx];
+  SegBuf sb;
+  sb.ar = cache.ar;
+  Buf f;
+  buildSegs(t, 0, t.nops, ctx, sb, f);
+  flushFrag(sb, f, cache.ar);
+  cache.skels[skelIdx].segs = sb.segs;
+  cache.skels[skelIdx].nsegs = sb.n;
+  e.done = true;
+  return skelIdx;
+}
+
+// Build a sub-skeleton for ops[pc..endPc) (a fresh fragment buffer).
+static void buildSubSkel(Template& t, uint32_t pc, uint32_t endPc, CCtx& ctx, SegBuf& out) {
+  Buf f;
+  buildSegs(t, pc, endPc, ctx, out, f);
+  flushFrag(out, f, ctx.ar);
+}
+
+static void buildSegs(Template& t, uint32_t pc, uint32_t endPc, CCtx& ctx, SegBuf& out,
+                      Buf& frag) {
+  while (pc < endPc) {
+    Op& op = t.ops[pc];
+    switch (op.kind) {
+      case Op::Text:
+        frag.append(op.text);
+        pc++;
+        break;
+      case Op::Var:
+      case Op::Raw: {
+        Chain ch;
+        Ty fty;
+        bool isStatic = false;
+        if (!resolvePathType(op.path, op.npath, ctx, ch, fty, isStatic)) {
+          pc++;  // undefined path -> "" (nothing emitted)
+          break;
+        }
+        if (isStatic) {
+          BVal v = evalStaticChain(ch, ctx);
+          if (op.kind == Op::Var) appendBValEscaped(frag, v);
+          else appendBValText(frag, v);
+        } else {
+          flushFrag(out, frag, ctx.ar);
+          Seg s;
+          s.kind = op.kind == Op::Var ? Seg::Var : Seg::Raw;
+          s.chain = ch;
+          tryFastAcc(ch, ctx, s.fast);
+          out.add(s);
+        }
+        pc++;
+        break;
+      }
+      case Op::If: {
+        int32_t elsePc = op.elsePc;
+        int32_t endIf = elsePc >= 0 ? (int32_t)t.ops[elsePc].jump : (int32_t)op.jump;
+        uint32_t thenEnd = elsePc >= 0 ? (uint32_t)elsePc : (uint32_t)endIf;
+        Chain ch;
+        Ty fty;
+        bool isStatic = false;
+        bool ok = resolvePathType(op.path, op.npath, ctx, ch, fty, isStatic);
+        if (!ok) {
+          // undefined -> statically false: else branch only
+          if (elsePc >= 0) buildSegs(t, (uint32_t)elsePc + 1, (uint32_t)endIf, ctx, out, frag);
+          pc = (uint32_t)endIf + 1;
+          break;
+        }
+        if (isStatic) {
+          BVal v = evalStaticChain(ch, ctx);
+          bool tr = truthyB(v);
+          if (op.neg) tr = !tr;
+          if (tr) buildSegs(t, pc + 1, thenEnd, ctx, out, frag);
+          else if (elsePc >= 0) buildSegs(t, (uint32_t)elsePc + 1, (uint32_t)endIf, ctx, out, frag);
+          pc = (uint32_t)endIf + 1;
+          break;
+        }
+        flushFrag(out, frag, ctx.ar);
+        Seg s;
+        s.kind = Seg::If;
+        s.chain = ch;
+        s.neg = op.neg;
+        SegBuf thenBuf;
+        thenBuf.ar = ctx.ar;
+        buildSubSkel(t, pc + 1, thenEnd, ctx, thenBuf);
+        s.thenSegs = thenBuf.segs;
+        s.nThen = thenBuf.n;
+        if (elsePc >= 0) {
+          SegBuf elseBuf;
+          elseBuf.ar = ctx.ar;
+          buildSubSkel(t, (uint32_t)elsePc + 1, (uint32_t)endIf, ctx, elseBuf);
+          s.elseSegs = elseBuf.segs;
+          s.nElse = elseBuf.n;
+        }
+        out.add(s);
+        pc = (uint32_t)endIf + 1;
+        break;
+      }
+      case Op::For: {
+        int32_t endFor = op.jump - 1;  // the EndFor op index
+        Chain ch;
+        Ty fty;
+        bool isStatic = false;
+        bool ok = resolvePathType(op.path, op.npath, ctx, ch, fty, isStatic);
+        if (!ok) {
+          pc = (uint32_t)op.jump;  // undefined -> no iterations
+          break;
+        }
+        Ty elemTy = arrElemTy(fty);
+        if (elemTy == T_Undef) {
+          pc = (uint32_t)op.jump;  // not an array -> never iterates
+          break;
+        }
+        if (isStatic) {
+          BVal arrV = evalStaticChain(ch, ctx);
+          if (arrV.kind == BVal::Arr && arrV.arrN > 0) {
+            for (uint32_t ei = 0; ei < arrV.arrN; ei++) {
+              CCtx::Bind b;
+              b.varName = op.varName;
+              b.elemTy = (uint8_t)elemTy;
+              b.isStatic = true;
+              b.staticElem = bvalArrElem(arrV, ei);
+              b.staticIdx = ei;
+              b.staticLen = arrV.arrN;
+              ctx.binds[ctx.nbinds++] = b;
+              buildSegs(t, pc + 1, (uint32_t)endFor, ctx, out, frag);
+              ctx.nbinds--;
+            }
+          }
+          pc = (uint32_t)op.jump;
+          break;
+        }
+        flushFrag(out, frag, ctx.ar);
+        Seg s;
+        s.kind = Seg::For;
+        s.chain = ch;
+        CCtx::Bind b;
+        b.varName = op.varName;
+        b.elemTy = (uint8_t)elemTy;
+        b.isStatic = false;
+        ctx.binds[ctx.nbinds++] = b;
+        SegBuf bodyBuf;
+        bodyBuf.ar = ctx.ar;
+        buildSubSkel(t, pc + 1, (uint32_t)endFor, ctx, bodyBuf);
+        ctx.nbinds--;
+        s.thenSegs = bodyBuf.segs;
+        s.nThen = bodyBuf.n;
+        out.add(s);
+        pc = (uint32_t)op.jump;
+        break;
+      }
+      case Op::Include: {
+        int32_t tgt = op.tmpl;
+        if (tgt < 0) {
+          pc++;  // missing / failed template renders nothing
+          break;
+        }
+        flushFrag(out, frag, ctx.ar);
+        int32_t skelIdx = getOrCompileSkel(tgt, ctx);
+        Seg s;
+        s.kind = Seg::Include;
+        s.skelIdx = skelIdx;
+        out.add(s);
+        pc++;
+        break;
+      }
+      default:  // Else / EndIf / EndFor: consumed by the enclosing If/For
+        pc++;
+        break;
+    }
+  }
+}
+
+// ---- executor ----
+
+static void execSkel(const Seg* segs, uint32_t n, RCtx& ctx, Buf& out, bool stream,
+                     uint32_t depth, Skel* skels) {
+  for (uint32_t i = 0; i < n; i++) {
+    const Seg& s = segs[i];
+    switch (s.kind) {
+      case Seg::Frag:
+        out.append(stream ? s.escFrag : s.frag);
+        break;
+      case Seg::Var: {
+        if (s.fast.slot != 255) appendFast(out, s.fast, ctx, stream ? 3 : 1);
+        else {
+          BVal v = resolveChain(s.chain, ctx);
+          if (stream) appendBValEscapedJson(out, v);
+          else appendBValEscaped(out, v);
+        }
+        break;
+      }
+      case Seg::Raw: {
+        if (s.fast.slot != 255) appendFast(out, s.fast, ctx, stream ? 2 : 0);
+        else {
+          BVal v = resolveChain(s.chain, ctx);
+          if (stream) appendBValJson(out, v);
+          else appendBValText(out, v);
+        }
+        break;
+      }
+      case Seg::If: {
+        BVal v = resolveChain(s.chain, ctx);
+        bool tr = truthyB(v);
+        if (s.neg) tr = !tr;
+        if (tr) execSkel(s.thenSegs, s.nThen, ctx, out, stream, depth, skels);
+        else execSkel(s.elseSegs, s.nElse, ctx, out, stream, depth, skels);
+        break;
+      }
+      case Seg::For: {
+        BVal v = resolveChain(s.chain, ctx);
+        if (v.kind == BVal::Arr && v.arrN > 0) {
+          LoopFrame f;
+          f.arr = v.arr;
+          f.len = v.arrN;
+          f.arrKind = v.arrKind;
+          f.idx = 0;
+          ctx.frames[ctx.nframes] = f;
+          uint32_t slot = ctx.nframes;
+          ctx.nframes++;
+          for (uint32_t ei = 0; ei < v.arrN; ei++) {
+            ctx.frames[slot].idx = ei;
+            execSkel(s.thenSegs, s.nThen, ctx, out, stream, depth, skels);
+          }
+          ctx.nframes--;
+        }
+        break;
+      }
+      case Seg::Include: {
+        if (depth < 8 && s.skelIdx >= 0) {
+          execSkel(skels[s.skelIdx].segs, skels[s.skelIdx].nsegs, ctx, out, stream, depth + 1,
+                   skels);
+        }
+        break;
+      }
+    }
+  }
+}
+
+// Run one case (flat v6). Returns false on a structural problem (never
+// for valid input). The output is appended to `out`. Port of runCase:
+// same steps, same report lines, same emission order — but the input is
+// flat structs (no Val tree, no find() scans). Step 7 still renders
+// through the v4 template engine via Val objects built from the flat
+// fields (bridge; replaced by the baked executor in stage 2).
+static bool runCaseFlat(Arena* ar, const CaseF& input, Emitter& out) {
+  if (!input.hasSite || !input.hasTemplates || !input.hasFiles) return false;
 
   // ---- templates: sorted by name, compiled; failures are reported.
-  uint32_t ntplNames = templatesV->obj.n;
+  uint32_t ntplNames = input.ntpls;
+  TplSrc* sortedTpls = ar->allocArr<TplSrc>(ntplNames ? ntplNames : 1);
+  for (uint32_t i = 0; i < ntplNames; i++) sortedTpls[i] = input.tpls[i];
+  std::sort(sortedTpls, sortedTpls + ntplNames,
+            [](const TplSrc& a, const TplSrc& b) { return cmpStr(a.name, b.name) < 0; });
   Str* tplNames = ar->allocArr<Str>(ntplNames ? ntplNames : 1);
-  for (uint32_t i = 0; i < ntplNames; i++) tplNames[i] = templatesV->obj.items[i].key;
-  std::sort(tplNames, tplNames + ntplNames,
-            [](Str a, Str b) { return cmpStr(a, b) < 0; });
+  for (uint32_t i = 0; i < ntplNames; i++) tplNames[i] = sortedTpls[i].name;
   Template* tpls = ar->allocArr<Template>(ntplNames ? ntplNames : 1);
   bool* tplOk = ar->allocArr<bool>(ntplNames ? ntplNames : 1);
-  // name -> index map (sorted names, identity here since tpls is in
-  // sorted order).
   auto findTpl = [&](Str name) -> int32_t {
     uint32_t lo = 0, hi = ntplNames;
     while (lo < hi) {
@@ -3701,7 +5609,6 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
   int32_t* nameIdx = ar->allocArr<int32_t>(ntplNames ? ntplNames : 1);
   for (uint32_t i = 0; i < ntplNames; i++) nameIdx[i] = (int32_t)i;
 
-  // Report lines (arena strings).
   Str* report = nullptr;
   uint32_t nreport = 0, capReport = 0;
   auto pushReport = [&](Str line) {
@@ -3715,12 +5622,11 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
   };
 
   for (uint32_t i = 0; i < ntplNames; i++) {
-    const Val* srcV = templatesV->find(tplNames[i]);
-    Str src = (srcV && srcV->type == Val::Str) ? srcV->s : Str();
     TplErr err;
     {
       ProfTimer _pt("tpl.compile");
-      if (compileTemplate(ar, tplNames[i], src, tpls[i], tplNames, nameIdx, ntplNames, err)) {
+      if (compileTemplate(ar, tplNames[i], sortedTpls[i].src, tpls[i], tplNames, nameIdx,
+                          ntplNames, err)) {
         tplOk[i] = true;
       } else {
         tplOk[i] = false;
@@ -3737,48 +5643,30 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
     }
   }
 
-  const Val* baseV = siteV->find("base_url");
-  Str base = (baseV && baseV->type == Val::Str) ? baseV->s : Str();
+  Str base = input.base;
   while (base.n > 0 && base.p[base.n - 1] == '/') base = base.substr(0, base.n - 1);
-  const Val* siteTitleV = siteV->find("title");
-  Str siteTitle = (siteTitleV && siteTitleV->type == Val::Str) ? siteTitleV->s : Str();
-  const Val* perPageV = siteV->find("per_page");
-  const Val* recentV = siteV->find("recent");
+  Str siteTitle = input.siteTitle;
 
   // ---- 1. Sources, in code-unit order of their paths.
-  uint32_t nfiles = filesV->arr.n;
-  // Index-sort the files by path (the input order is already sorted in
-  // practice, but the reference sorts explicitly).
+  uint32_t nfiles = input.nfiles;
   uint32_t* fidx = ar->allocArr<uint32_t>(nfiles ? nfiles : 1);
   for (uint32_t i = 0; i < nfiles; i++) fidx[i] = i;
   std::sort(fidx, fidx + nfiles, [&](uint32_t a, uint32_t b) {
-    const Val* fa = &filesV->arr.items[a];
-    const Val* fb = &filesV->arr.items[b];
-    Str pa = fa->find("path") && fa->find("path")->type == Val::Str ? fa->find("path")->s : Str();
-    Str pb = fb->find("path") && fb->find("path")->type == Val::Str ? fb->find("path")->s : Str();
-    return cmpStr(pa, pb) < 0;
+    return cmpStr(input.files[a].path, input.files[b].path) < 0;
   });
-  Source* sources = ar->allocArr<Source>(nfiles ? nfiles : 1);
+  SourceF* sources = ar->allocArr<SourceF>(nfiles ? nfiles : 1);
   uint32_t nsources = 0;
   Str* staticPaths = ar->allocArr<Str>(nfiles ? nfiles : 1);
   Str* staticContents = ar->allocArr<Str>(nfiles ? nfiles : 1);
   uint32_t nstatics = 0;
   for (uint32_t fi = 0; fi < nfiles; fi++) {
-    const Val* f = &filesV->arr.items[fidx[fi]];
-    const Val* pathV = f->find("path");
-    const Val* contentV = f->find("content");
-    if (!pathV || pathV->type != Val::Str || !contentV || contentV->type != Val::Str)
-      continue;
-    Str path = pathV->s;
-    Str content = contentV->s;
+    const FileSrc& f = input.files[fidx[fi]];
+    Str path = f.path;
+    Str content = f.content;
     if (path.endsWith(S(".md"))) {
       // CR-normalize: \r\n? -> \n (only when a '\r' is present).
-      bool hasCR = false;
-      for (uint32_t q = 0; q < content.n; q++)
-        if (content.p[q] == '\r') {
-          hasCR = true;
-          break;
-        }
+      // memchr (SIMD) for the scan; the copy loop only runs when CRs exist.
+      bool hasCR = std::memchr(content.p, '\r', content.n) != nullptr;
       Str text = content;
       if (hasCR) {
         Buf nb;
@@ -3792,8 +5680,8 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
         }
         text = ar->dup(nb.view());
       }
-      Source& s = sources[nsources++];
-      s = Source();
+      SourceF& s = sources[nsources++];
+      s = SourceF();
       s.path = path;
       s.text = text;
     } else {
@@ -3805,16 +5693,16 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
 
   auto _t2 = std::chrono::steady_clock::now();
   // ---- 2. Front matter + refusal checks.
-  Source* kept = ar->allocArr<Source>(nsources ? nsources : 1);
+  SourceF* kept = ar->allocArr<SourceF>(nsources ? nsources : 1);
   uint32_t nkept = 0;
   for (uint32_t i = 0; i < nsources; i++) {
-    Source& s = sources[i];
-    FmResult fm = parseFrontMatter(ar, s.text);
+    SourceF& s = sources[i];
+    FmResultF fm = parseFrontMatterFlat(ar, s.text);
     if (fm.err) {
       pushReport(ar->cat({S("refused "), s.path, S(": "), fm.errMsg}));
       continue;
     }
-    s.data = fm.data;
+    s.fm = fm.fm;
     s.body = fm.body;
     s.post = s.path.startsWith(S("posts/"));
     Str own;
@@ -3830,14 +5718,11 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
       pushReport(ar->cat({S("refused "), s.path, S(": "), own, S("/ is the generator's own")}));
       continue;
     }
-    if (s.post && !s.data.find("date")) {
+    if (s.post && !s.fm.hasDate) {
       pushReport(ar->cat({S("refused "), s.path, S(": a post needs a date")}));
       continue;
     }
-    const Val* layoutV = s.data.find("layout");
-    Str layout = layoutV && layoutV->type == Val::Str
-                     ? layoutV->s
-                     : (s.post ? S("post") : S("page"));
+    Str layout = s.fm.hasLayout ? s.fm.layout : (s.post ? S("post") : S("page"));
     int32_t li = findTpl(layout);
     if (li < 0 || !tplOk[li]) {
       pushReport(ar->cat({S("refused "), s.path, S(": layout \""), layout,
@@ -3845,8 +5730,7 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
       continue;
     }
     s.layout = layout;
-    const Val* draftV = s.data.find("draft");
-    if (draftV && draftV->type == Val::Bool && draftV->b) {
+    if (s.fm.draft) {
       pushReport(ar->cat({S("draft "), s.path}));
       continue;
     }
@@ -3858,7 +5742,6 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
   Prof::add("step2.fm", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t2).count());
   auto _t3 = std::chrono::steady_clock::now();
   // ---- 3. Permalinks.
-  // taken sets per directory (root starts with RESERVED).
   struct TakenSet {
     Str dir;
     Str* slugs = nullptr;
@@ -3927,13 +5810,9 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
     return slash == (size_t)-1 ? Str() : path.substr(0, slash);
   };
   for (uint32_t i = 0; i < nsources; i++) {
-    Source& s = sources[i];
+    SourceF& s = sources[i];
     Str dir = s.post ? S("posts") : dirOf(s.path);
-    const Val* slugV = s.data.find("slug");
-    const Val* titleV = s.data.find("title");
-    Str baseSlug = (slugV && slugV->type == Val::Str)
-                       ? slugV->s
-                       : slugOf(ar, titleV && titleV->type == Val::Str ? titleV->s : Str());
+    Str baseSlug = s.fm.hasSlug ? s.fm.slug : slugOf(ar, s.fm.title);
     s.slug = uniqueSlug(baseSlug, takenIn(dir));
     s.outDir = dir.n == 0 ? s.slug : ar->cat({dir, S("/"), s.slug});
     s.url = ar->cat({base, S("/"), s.outDir, S("/")});
@@ -3946,8 +5825,6 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
     pageLinks[i].path = sources[i].path;
     pageLinks[i].url = sources[i].url;
   }
-  // pageLinks is already sorted by path (sources are in path order).
-  // staticPaths is sorted too (statics were collected in path order).
   Str* allBroken = nullptr;
   uint32_t nBroken = 0, capBroken = 0;
   auto pushBroken = [&](Str line) {
@@ -3960,9 +5837,8 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
     allBroken[nBroken++] = line;
   };
   for (uint32_t i = 0; i < nsources; i++) {
-    Source& s = sources[i];
+    SourceF& s = sources[i];
     Str dir = dirOf(s.path);
-    // dirParts: split dir on '/'.
     Str dirPartsArr[32];
     uint32_t nDirParts = 0;
     if (dir.n > 0) {
@@ -4000,10 +5876,8 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
   for (uint32_t i = 0; i < nsources; i++)
     if (sources[i].post) postIdx[nposts++] = i;
   std::sort(postIdx, postIdx + nposts, [&](uint32_t a, uint32_t b) {
-    const Val* da = sources[a].data.find("date");
-    const Val* db = sources[b].data.find("date");
-    Str sa = da && da->type == Val::Str ? da->s : Str();
-    Str sb = db && db->type == Val::Str ? db->s : Str();
+    Str sa = sources[a].fm.date;
+    Str sb = sources[b].fm.date;
     int c = cmpStr(sb, sa);  // date DESC
     if (c) return c < 0;
     return cmpStr(sources[a].slug, sources[b].slug) < 0;
@@ -4017,35 +5891,19 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
   Prof::add("step5.coll", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t5).count());
   auto _t6 = std::chrono::steady_clock::now();
   // ---- 6. Tags, grouped by slug, named as first met in the posts' order.
-  // Each source keeps its card's tag links directly (a TagObj's memoized
-  // link, or a fresh {name, slug, url:''} for a synthetic tag).
-  // NOTE: capacity is NOT nsources — one source can hold many distinct
-  // tags, so the array grows on demand (writing past a fixed nsources
-  // capacity corrupts the arena and the tag links).
   uint32_t capTags = 16;
-  TagObj* tags = ar->allocArr<TagObj>(capTags);
+  TagObjF* tags = ar->allocArr<TagObjF>(capTags);
   uint32_t ntags = 0;
   auto findTagBySlug = [&](Str slug) -> int32_t {
     for (uint32_t q = 0; q < ntags; q++)
       if (strEq(tags[q].slug, slug)) return (int32_t)q;
     return -1;
   };
-  auto tagLinkVal = [&](Arena* a, Str name, Str slug, Str url) -> Val {
-    KV* kv = a->allocArr<KV>(3);
-    kv[0] = KV{S("name"), Val::str(name)};
-    kv[1] = KV{S("slug"), Val::str(slug)};
-    kv[2] = KV{S("url"), Val::str(url)};
-    return Val::object(kv, 3);
-  };
-  // ownTags(s): the source's tags, deduplicated by slug (first name kept).
-  auto ownTags = [&](const Source& s, std::pair<Str, Str>* out) -> uint32_t {
-    const Val* tagsV = s.data.find("tags");
+  auto ownTags = [&](const SourceF& s, std::pair<Str, Str>* out) -> uint32_t {
     uint32_t n = 0;
-    if (!tagsV || tagsV->type != Val::Arr) return 0;
-    for (uint32_t q = 0; q < tagsV->arr.n; q++) {
-      const Val* tv = &tagsV->arr.items[q];
-      if (tv->type != Val::Str) continue;
-      Str slug = slugOf(ar, tv->s);
+    for (uint32_t q = 0; q < s.fm.ntags; q++) {
+      Str tv = s.fm.tags[q];
+      Str slug = slugOf(ar, tv);
       bool seen = false;
       for (uint32_t r = 0; r < n; r++)
         if (strEq(out[r].second, slug)) {
@@ -4053,15 +5911,15 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
           break;
         }
       if (seen) continue;
-      out[n++] = {tv->s, slug};
+      out[n++] = {tv, slug};
     }
     return n;
   };
   for (uint32_t k = 0; k < nposts; k++) {
-    Source& p = sources[postIdx[k]];
+    SourceF& p = sources[postIdx[k]];
     std::pair<Str, Str> own[64];
     uint32_t nown = ownTags(p, own);
-    p.tagLinks = ar->allocArr<Val>(nown ? nown : 1);
+    p.tagLinks = ar->allocArr<TagLinkF>(nown ? nown : 1);
     p.ntagLinks = 0;
     for (uint32_t q = 0; q < nown; q++) {
       Str tname = own[q].first, tslug = own[q].second;
@@ -4069,17 +5927,17 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
       if (ti < 0) {
         if (ntags == capTags) {
           capTags *= 2;
-          TagObj* nt = ar->allocArr<TagObj>(capTags);
-          if (tags) std::memcpy(nt, tags, sizeof(TagObj) * ntags);
+          TagObjF* nt = ar->allocArr<TagObjF>(capTags);
+          if (tags) std::memcpy(nt, tags, sizeof(TagObjF) * ntags);
           tags = nt;
         }
         ti = (int32_t)ntags++;
-        tags[ti] = TagObj();
+        tags[ti] = TagObjF();
         tags[ti].name = tname;
         tags[ti].slug = tslug;
         tags[ti].url = ar->cat({base, S("/tags/"), tslug, S("/")});
       }
-      TagObj& t = tags[ti];
+      TagObjF& t = tags[ti];
       if (t.nposts == t.capPosts) {
         t.capPosts = t.capPosts ? t.capPosts * 2 : 4;
         uint32_t* ni = ar->allocArr<uint32_t>(t.capPosts);
@@ -4088,166 +5946,176 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
       }
       t.posts[t.nposts++] = postIdx[k];
       if (!t.hasLink) {
-        t.link = tagLinkVal(ar, t.name, t.slug, t.url);
+        t.link.name = t.name;
+        t.link.slug = t.slug;
+        t.link.url = t.url;
+        t.link.count = 0;
+        t.link.hasCount = false;
         t.hasLink = true;
       }
       p.tagLinks[p.ntagLinks++] = t.link;
     }
   }
   for (uint32_t i = 0; i < nsources; i++) {
-    Source& s = sources[i];
+    SourceF& s = sources[i];
     if (s.post) continue;
     std::pair<Str, Str> own[64];
     uint32_t nown = ownTags(s, own);
-    s.tagLinks = ar->allocArr<Val>(nown ? nown : 1);
+    s.tagLinks = ar->allocArr<TagLinkF>(nown ? nown : 1);
     s.ntagLinks = 0;
     for (uint32_t q = 0; q < nown; q++) {
       Str tname = own[q].first, tslug = own[q].second;
       int32_t ti = findTagBySlug(tslug);
       if (ti >= 0) {
-        TagObj& t = tags[ti];
+        TagObjF& t = tags[ti];
         if (!t.hasLink) {
-          t.link = tagLinkVal(ar, t.name, t.slug, t.url);
+          t.link.name = t.name;
+          t.link.slug = t.slug;
+          t.link.url = t.url;
+          t.link.count = 0;
+          t.link.hasCount = false;
           t.hasLink = true;
         }
         s.tagLinks[s.ntagLinks++] = t.link;
       } else {
-        // Synthetic tag (not in bySlug): url '', its own link.
-        s.tagLinks[s.ntagLinks++] = tagLinkVal(ar, tname, tslug, Str());
+        TagLinkF syn;
+        syn.name = tname;
+        syn.slug = tslug;
+        syn.url = Str();
+        syn.count = 0;
+        syn.hasCount = false;
+        s.tagLinks[s.ntagLinks++] = syn;
       }
     }
   }
-  // The tags list: only bySlug tags, sorted by count desc then slug asc.
-  std::sort(tags, tags + ntags, [](const TagObj& a, const TagObj& b) {
+  std::sort(tags, tags + ntags, [](const TagObjF& a, const TagObjF& b) {
     if (a.nposts != b.nposts) return a.nposts > b.nposts;
     return cmpStr(a.slug, b.slug) < 0;
   });
 
   Prof::add("step6.tags", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t6).count());
   auto _t7 = std::chrono::steady_clock::now();
-  // ---- 7. Layouts.
-  // cardOf(s): one card per source, computed once.
-  auto linkOf = [&](int32_t srcIdx) -> Val {
-    if (srcIdx < 0) return Val::nullv();
-    const Source& s = sources[srcIdx];
-    const Val* dateV = s.data.find("date");
-    Str date = dateV && dateV->type == Val::Str ? dateV->s : Str();
-    KV* kv = ar->allocArr<KV>(4);
-    const Val* titleV = s.data.find("title");
-    kv[0] = KV{S("title"), Val::str(titleV && titleV->type == Val::Str ? titleV->s : Str())};
-    kv[1] = KV{S("url"), Val::str(s.url)};
-    kv[2] = KV{S("date"), Val::str(date)};
-    kv[3] = KV{S("date_long"), Val::str(dateV ? longDate(ar, date) : Str())};
-    return Val::object(kv, 4);
-  };
+  // ---- 7. Layouts (flat structs + baked executor).
+  auto _tCards = std::chrono::steady_clock::now();
   for (uint32_t i = 0; i < nsources; i++) {
-    Source& s = sources[i];
-    const Val* dateV = s.data.find("date");
-    const Val* titleV = s.data.find("title");
-    const Val* summaryV = s.data.find("summary");
-    Str date = dateV && dateV->type == Val::Str ? dateV->s : Str();
+    SourceF& s = sources[i];
+    Str date = s.fm.hasDate ? s.fm.date : Str();
     int64_t minutes = wordsOf(s.body);
     minutes = (minutes + 199) / 200;
     if (minutes < 1) minutes = 1;
-    KV* kv = ar->allocArr<KV>(8);
-    kv[0] = KV{S("title"), Val::str(titleV && titleV->type == Val::Str ? titleV->s : Str())};
-    kv[1] = KV{S("url"), Val::str(s.url)};
-    kv[2] = KV{S("date"), Val::str(date)};
-    kv[3] = KV{S("date_long"), Val::str(dateV ? longDate(ar, date) : Str())};
-    kv[4] = KV{S("summary"),
-               Val::str(summaryV && summaryV->type == Val::Str ? summaryV->s : Str())};
-    kv[5] = KV{S("excerpt"), Val::str(s.excerpt)};
-    kv[6] = KV{S("reading_minutes"), Val::integer(minutes)};
-    kv[7] = KV{S("tags"), Val::array(s.tagLinks, s.ntagLinks)};
-    s.card = Val::object(kv, 8);
+    s.card.title = s.fm.title;
+    s.card.url = s.url;
+    s.card.date = date;
+    s.card.date_long = s.fm.hasDate ? longDate(ar, date) : Str();
+    s.card.summary = s.fm.hasSummary ? s.fm.summary : Str();
+    s.card.excerpt = s.excerpt;
+    s.card.reading_minutes = minutes;
+    s.card.tags = s.tagLinks;
+    s.card.ntags = s.ntagLinks;
+    if (s.newer >= 0) {
+      const SourceF& nb = sources[s.newer];
+      s.newerL.title = nb.fm.title;
+      s.newerL.url = nb.url;
+      s.newerL.date = nb.fm.hasDate ? nb.fm.date : Str();
+      s.newerL.date_long = nb.fm.hasDate ? longDate(ar, nb.fm.date) : Str();
+    }
+    if (s.older >= 0) {
+      const SourceF& nb = sources[s.older];
+      s.olderL.title = nb.fm.title;
+      s.olderL.url = nb.url;
+      s.olderL.date = nb.fm.hasDate ? nb.fm.date : Str();
+      s.olderL.date_long = nb.fm.hasDate ? longDate(ar, nb.fm.date) : Str();
+    }
   }
-  // site / allTags / recent (JS slice semantics).
-  KV* siteKv = ar->allocArr<KV>(2);
-  siteKv[0] = KV{S("title"), Val::str(siteTitle)};
-  siteKv[1] = KV{S("base_url"), Val::str(base)};
-  Val siteObj = Val::object(siteKv, 2);
-  Val* allTagsArr = ar->allocArr<Val>(ntags ? ntags : 1);
+  Prof::add("s7.cards", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tCards).count());
+  SiteF site;
+  site.title = siteTitle;
+  site.base_url = base;
+  TagLinkF* allTagsArr = ar->allocArr<TagLinkF>(ntags ? ntags : 1);
   for (uint32_t q = 0; q < ntags; q++) {
-    KV* kv = ar->allocArr<KV>(4);
-    kv[0] = KV{S("name"), Val::str(tags[q].name)};
-    kv[1] = KV{S("slug"), Val::str(tags[q].slug)};
-    kv[2] = KV{S("url"), Val::str(tags[q].url)};
-    kv[3] = KV{S("count"), Val::integer(tags[q].nposts)};
-    allTagsArr[q] = Val::object(kv, 4);
+    allTagsArr[q].name = tags[q].name;
+    allTagsArr[q].slug = tags[q].slug;
+    allTagsArr[q].url = tags[q].url;
+    allTagsArr[q].count = tags[q].nposts;
+    allTagsArr[q].hasCount = true;
   }
-  Val allTags = Val::array(allTagsArr, ntags);
   int64_t rFrom = 0, rTo = 0;
   {
-    double recentNum = recentV && recentV->type == Val::Int
-                           ? (double)recentV->i
-                           : (recentV && recentV->type == Val::Dbl ? recentV->d
-                                                                    : std::nan(""));
-    bool hasRecent = recentV && recentV->isNum();
-    jsSliceRange((int64_t)nposts, 0, hasRecent, recentNum, rFrom, rTo);
+    double recentNum = input.hasRecent ? input.recentNum : std::nan("");
+    jsSliceRange((int64_t)nposts, 0, input.hasRecent, recentNum, rFrom, rTo);
   }
-  Val* recentArr = ar->allocArr<Val>((rTo - rFrom) > 0 ? (uint32_t)(rTo - rFrom) : 1);
+  CardF* recentArr = ar->allocArr<CardF>((rTo - rFrom) > 0 ? (uint32_t)(rTo - rFrom) : 1);
   for (int64_t q = rFrom; q < rTo; q++) recentArr[q - rFrom] = sources[postIdx[q]].card;
-  Val recent = Val::array(recentArr, (uint32_t)(rTo - rFrom));
 
-  // Render helper: find a template by name; false when it does not exist
-  // or did not parse.
-  Frame frames[64];
+  SkelCache cache;
+  cache.tpls = tpls;
+  cache.tplOk = tplOk;
+  cache.ntpls = ntplNames;
+  cache.ar = ar;
+  RCtx baseCtx;
+  baseCtx.site = site;
+  baseCtx.allTags = allTagsArr;
+  baseCtx.nAllTags = ntags;
+  baseCtx.recent = recentArr;
+  baseCtx.nRecent = (uint32_t)(rTo - rFrom);
   Buf renderOut;
-  auto render = [&](Str name, KV* extraVars, uint32_t nExtra, Str& htmlOut) -> bool {
+  auto renderBaked = [&](Str name, int renderKind, RCtx& rctx, Str& htmlOut) -> bool {
     int32_t ti = findTpl(name);
     if (ti < 0 || !tplOk[ti]) return false;
-    KV* vars = ar->allocArr<KV>(3 + nExtra);
-    vars[0] = KV{S("site"), siteObj};
-    vars[1] = KV{S("tags"), allTags};
-    vars[2] = KV{S("recent"), recent};
-    for (uint32_t q = 0; q < nExtra; q++) vars[3 + q] = extraVars[q];
-    uint32_t nframes = 0;
-    frames[nframes] = Frame();
-    frames[nframes].vars = vars;
-    frames[nframes].nvars = 3 + nExtra;
-    nframes++;
+    CCtx cctx;
+    cctx.renderKind = renderKind;
+    cctx.site = site;
+    cctx.allTags = allTagsArr;
+    cctx.nAllTags = ntags;
+    cctx.recent = recentArr;
+    cctx.nRecent = (uint32_t)(rTo - rFrom);
+    cctx.ar = ar;
+    cctx.cache = &cache;
+    int32_t skelIdx = getOrCompileSkel(ti, cctx);
+    rctx.nframes = 0;
     renderOut.reset();
-    execTemplate(tpls, ti, frames, nframes, renderOut, out.collect == nullptr);
-    // Stream mode consumes the HTML immediately (emitter escapes it on
-    // the spot), so skip the arena copy; collect mode (runOne) still
-    // needs the dup because the string outlives this call.
+    {
+      ProfTimer _pt("tpl.exec");
+      execSkel(cache.skels[skelIdx].segs, cache.skels[skelIdx].nsegs, rctx, renderOut,
+               out.collect == nullptr, 0, cache.skels);
+    }
     htmlOut = out.collect ? ar->dup(renderOut.view()) : renderOut.view();
     return true;
   };
 
   // Source pages (in source order).
+  auto _tPages = std::chrono::steady_clock::now();
   for (uint32_t i = 0; i < nsources; i++) {
-    Source& s = sources[i];
-    // pageOf(s): the card + slug/content/toc/newer/older/is_post.
-    KV* pageKv = ar->allocArr<KV>(14);
-    for (uint32_t q = 0; q < 8; q++) pageKv[q] = s.card.obj.items[q];
-    pageKv[8] = KV{S("slug"), Val::str(s.slug)};
-    pageKv[9] = KV{S("content"), Val::str(s.html)};
-    Val* tocArr = ar->allocArr<Val>(s.ntoc ? s.ntoc : 1);
-    for (uint32_t q = 0; q < s.ntoc; q++) {
-      KV* hkv = ar->allocArr<KV>(3);
-      hkv[0] = KV{S("level"), Val::integer(s.toc[q].level)};
-      hkv[1] = KV{S("id"), Val::str(s.toc[q].id)};
-      hkv[2] = KV{S("html"), Val::str(s.toc[q].html)};
-      tocArr[q] = Val::object(hkv, 3);
-    }
-    pageKv[10] = KV{S("toc"), Val::array(tocArr, s.ntoc)};
-    pageKv[11] = KV{S("newer"), linkOf(s.newer)};
-    pageKv[12] = KV{S("older"), linkOf(s.older)};
-    pageKv[13] = KV{S("is_post"), Val::boolean(s.post)};
-    Val page = Val::object(pageKv, 14);
-    KV extra[1] = {KV{S("page"), page}};
+    SourceF& s = sources[i];
+    PageF page;
+    page.title = s.card.title;
+    page.url = s.card.url;
+    page.date = s.card.date;
+    page.date_long = s.card.date_long;
+    page.summary = s.card.summary;
+    page.excerpt = s.card.excerpt;
+    page.reading_minutes = s.card.reading_minutes;
+    page.tags = s.card.tags;
+    page.ntags = s.card.ntags;
+    page.slug = s.slug;
+    page.content = s.html;
+    page.toc = s.toc;
+    page.ntoc = s.ntoc;
+    page.newer = s.newer >= 0 ? &s.newerL : nullptr;
+    page.older = s.older >= 0 ? &s.olderL : nullptr;
+    page.is_post = s.post;
+    RCtx rctx = baseCtx;
+    rctx.page = &page;
     Str html;
-    if (render(s.layout, extra, 1, html)) {
+    if (renderBaked(s.layout, 0, rctx, html)) {
       Str outPath = ar->cat({s.outDir, S("/index.html")});
       out.add(ar, outPath, html, true);
     }
   }
+  Prof::add("s7.pages", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tPages).count());
   // Index pages.
-  double perNum = perPageV && perPageV->type == Val::Int
-                      ? (double)perPageV->i
-                      : (perPageV && perPageV->type == Val::Dbl ? perPageV->d : std::nan(""));
-  bool hasPer = perPageV && perPageV->isNum();
+  double perNum = input.hasPer ? input.perNum : std::nan("");
+  bool hasPer = input.hasPer;
   int64_t pages = 0;
   if (hasPer && !std::isnan(perNum) && perNum >= 1) {
     double p = std::ceil((double)nposts / perNum);
@@ -4264,22 +6132,25 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
     int nn = std::snprintf(nb, sizeof nb, "%lld", (long long)k);
     return ar->cat({base, S("/page/"), Str(nb, (uint32_t)nn), S("/")});
   };
+  auto _tIndex = std::chrono::steady_clock::now();
   for (int64_t k = 1; k <= pages; k++) {
     int64_t from = 0, to = 0;
     jsSliceRange((int64_t)nposts, (double)(k - 1) * perNum, true, (double)k * perNum, from, to);
-    Val* postsArr = ar->allocArr<Val>((to - from) > 0 ? (uint32_t)(to - from) : 1);
+    CardF* postsArr = ar->allocArr<CardF>((to - from) > 0 ? (uint32_t)(to - from) : 1);
     for (int64_t q = from; q < to; q++) postsArr[q - from] = sources[postIdx[q]].card;
-    Val postsVal = Val::array(postsArr, (uint32_t)(to - from));
-    KV* pagerKv = ar->allocArr<KV>(5);
-    pagerKv[0] = KV{S("number"), Val::integer(k)};
-    pagerKv[1] = KV{S("total"), Val::integer(pages)};
-    pagerKv[2] = KV{S("url"), Val::str(indexUrl(k))};
-    pagerKv[3] = KV{S("newer_url"), Val::str(k == 1 ? Str() : indexUrl(k - 1))};
-    pagerKv[4] = KV{S("older_url"), Val::str(k == pages ? Str() : indexUrl(k + 1))};
-    Val pager = Val::object(pagerKv, 5);
-    KV extra[2] = {KV{S("posts"), postsVal}, KV{S("pager"), pager}};
+    PagerF pager;
+    pager.number = k;
+    pager.total = pages;
+    pager.url = indexUrl(k);
+    pager.newer_url = k == 1 ? Str() : indexUrl(k - 1);
+    pager.older_url = k == pages ? Str() : indexUrl(k + 1);
+    RCtx rctx = baseCtx;
+    rctx.posts = postsArr;
+    rctx.nPosts = (uint32_t)(to - from);
+    rctx.hasPosts = true;
+    rctx.pager = &pager;
     Str html;
-    if (render(S("index"), extra, 2, html)) {
+    if (renderBaked(S("index"), 1, rctx, html)) {
       if (k == 1) {
         out.add(ar, S("index.html"), html, true);
       } else {
@@ -4289,30 +6160,34 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
       }
     }
   }
+  Prof::add("s7.index", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tIndex).count());
   // Tag pages (in tags order).
+  auto _tTags = std::chrono::steady_clock::now();
   for (uint32_t q = 0; q < ntags; q++) {
-    TagObj& t = tags[q];
-    Val* postsArr = ar->allocArr<Val>(t.nposts ? t.nposts : 1);
+    TagObjF& t = tags[q];
+    CardF* postsArr = ar->allocArr<CardF>(t.nposts ? t.nposts : 1);
     for (uint32_t r = 0; r < t.nposts; r++) postsArr[r] = sources[t.posts[r]].card;
-    Val postsVal = Val::array(postsArr, t.nposts);
-    KV* tagKv = ar->allocArr<KV>(5);
-    tagKv[0] = KV{S("name"), Val::str(t.name)};
-    tagKv[1] = KV{S("slug"), Val::str(t.slug)};
-    tagKv[2] = KV{S("url"), Val::str(t.url)};
-    tagKv[3] = KV{S("count"), Val::integer(t.nposts)};
-    tagKv[4] = KV{S("posts"), postsVal};
-    Val tag = Val::object(tagKv, 5);
-    KV extra[1] = {KV{S("tag"), tag}};
+    TagF tag;
+    tag.name = t.name;
+    tag.slug = t.slug;
+    tag.url = t.url;
+    tag.count = t.nposts;
+    tag.posts = postsArr;
+    tag.nposts = t.nposts;
+    RCtx rctx = baseCtx;
+    rctx.tag = &tag;
     Str html;
-    if (render(S("tag"), extra, 1, html)) {
+    if (renderBaked(S("tag"), 2, rctx, html)) {
       out.add(ar, ar->cat({S("tags/"), t.slug, S("/index.html")}), html, true);
     }
   }
   // Tags index page.
   {
+    RCtx rctx = baseCtx;
     Str html;
-    if (render(S("tags"), nullptr, 0, html)) out.add(ar, S("tags/index.html"), html, true);
+    if (renderBaked(S("tags"), 3, rctx, html)) out.add(ar, S("tags/index.html"), html, true);
   }
+  Prof::add("s7.tagpages", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tTags).count());
   // Statics (shadowed when a built page already has the path; a static
   // named "__proto__" is dropped silently, as the JS assignment is).
   for (uint32_t q = 0; q < nstatics; q++) {
@@ -4326,6 +6201,7 @@ static bool runCase(Arena* ar, const Val& input, Emitter& out) {
   }
 
   Prof::add("step7.rest", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t7).count());
+
   auto _t8 = std::chrono::steady_clock::now();
   // ---- 8. The report.
   Str* lines = ar->allocArr<Str>(nreport + nBroken + 1);
@@ -4445,10 +6321,11 @@ static napi_value RunOne(napi_env env, napi_callback_info info) {
   Arena ar;
   ar.init(64u << 20);
   Val input = valueFromJs(env, argv[0], &ar);
+  CaseF cf = caseFromVal(&ar, input);
   CaseOut co;
   Emitter em;
   em.collect = &co;
-  if (!runCase(&ar, input, em)) {
+  if (!cf.hasSite || !cf.hasTemplates || !cf.hasFiles || !runCaseFlat(&ar, cf, em)) {
     napiThrow(env, "runCase failed (malformed input)");
     return nullptr;
   }
@@ -4517,12 +6394,13 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
       ProfTimer _ptA("arena.init");
       inputAr.init(64u << 20);
     }
-    Val cases;
+    CaseF* cases = nullptr;
+    uint32_t ncases = 0;
     {
       ProfTimer _pt("json_parse");
-      JsonParser parser((const uint8_t*)buf, (const uint8_t*)buf + fsize, &inputAr);
-      cases = parser.parse();
-      if (!parser.ok || cases.type != Val::Arr) {
+      FlatParser parser((const uint8_t*)buf, (const uint8_t*)buf + fsize, &inputAr);
+      cases = parser.parseCases(ncases);
+      if (!parser.ok || !cases) {
         std::free(buf);
         napiThrow(env, "cases.json is not a JSON array");
         return nullptr;
@@ -4536,10 +6414,9 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
     Buf answers;
     answers.reserve(8u << 20);
     answers.push('[');
-    for (uint32_t ci = 0; ci < cases.arr.n; ci++) {
-      const Val* c = &cases.arr.items[ci];
-      const Val* input = c->find("input");
-      if (!input || input->type != Val::Obj) {
+    for (uint32_t ci = 0; ci < ncases; ci++) {
+      const CaseF& c = cases[ci];
+      if (!c.hasInput) {
         std::free(buf);
         napiThrow(env, "a case has no input object");
         return nullptr;
@@ -4551,7 +6428,7 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
       em.out = &answers;
       {
         ProfTimer _pt2("runCase");
-        if (!runCase(&buildAr, *input, em)) {
+        if (!runCaseFlat(&buildAr, c, em)) {
           std::free(buf);
           napiThrow(env, "runCase failed");
           return nullptr;
@@ -4560,14 +6437,17 @@ static napi_value RunAll(napi_env env, napi_callback_info info) {
       answers.push('}');
     }
     answers.push(']');
-    FILE* of = std::fopen(outPath.c_str(), "wb");
-    if (!of) {
-      std::free(buf);
-      napiThrow(env, ("cannot write " + outPath).c_str());
-      return nullptr;
+    {
+      ProfTimer _pt("file.write");
+      FILE* of = std::fopen(outPath.c_str(), "wb");
+      if (!of) {
+        std::free(buf);
+        napiThrow(env, ("cannot write " + outPath).c_str());
+        return nullptr;
+      }
+      std::fwrite(answers.data, 1, answers.len, of);
+      std::fclose(of);
     }
-    std::fwrite(answers.data, 1, answers.len, of);
-    std::fclose(of);
   }
   std::free(buf);
   Prof::add("runAll.body", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tRunAll).count());
